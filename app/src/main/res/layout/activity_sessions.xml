@@ -115,6 +115,7 @@
         android:id="@+id/list"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:scrollbars="none"
         android:divider="#1F000000"
         android:dividerHeight="1px" />
 

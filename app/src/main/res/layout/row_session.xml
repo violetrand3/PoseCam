@@ -4,10 +4,10 @@
     android:layout_height="wrap_content"
     android:gravity="center_vertical"
     android:orientation="horizontal"
-    android:paddingBottom="10dp"
+    android:paddingBottom="14dp"
     android:paddingStart="4dp"
     android:paddingEnd="4dp"
-    android:paddingTop="10dp">
+    android:paddingTop="14dp">
 
     <LinearLayout
         android:layout_width="0dp"
@@ -25,23 +25,24 @@
             android:textSize="16sp" />
 
         <TextView
-            android:id="@+id/rowMeta"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:alpha="0.6"
-            android:ellipsize="end"
-            android:maxLines="1"
-            android:textSize="12sp" />
-
-        <TextView
             android:id="@+id/rowStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="2dp"
+            android:layout_marginTop="4dp"
             android:ellipsize="end"
             android:maxLines="1"
             android:textColor="?android:attr/textColorPrimary"
-            android:textSize="13sp" />
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/rowMeta"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="#757575"
+            android:textSize="12sp" />
     </LinearLayout>
 
     <!-- Only for a recording that failed to upload; a tap on it must not open the row's menu. -->

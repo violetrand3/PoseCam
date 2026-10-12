@@ -37,6 +37,9 @@ interface CloudApi {
     /** The backend's current record of a session, including whether it has reached the website. */
     suspend fun getSession(sessionId: String): CloudSessionView
 
+    /** Puts a synced recording the backend failed to publish (or never got to) back in its publish queue. */
+    suspend fun retryPublish(sessionId: String): CloudSessionView
+
     suspend fun completeSession(
         sessionId: String,
         recordingStatus: String,

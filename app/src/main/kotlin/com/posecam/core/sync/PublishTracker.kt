@@ -60,6 +60,19 @@ class PublishTracker(
         changed
     }
 
+    /**
+     * The collector's "Retry publish": asks the backend to queue the recording for publishing again and shows it as
+     * publishing until it answers. Unlike [checkDue] this surfaces the failure ([CloudException]) to the caller.
+     */
+    suspend fun retry(sessionId: String) {
+        lock.withLock {
+            api.retryPublish(sessionId)
+            repository.recordPublish(sessionId, PublishState.PENDING, 0, null)
+            lastChecked.remove(sessionId)
+            CloudLog.i("publish_retry", "session" to sessionId)
+        }
+    }
+
     private fun stateOf(view: CloudSessionView): PublishState = when (view.publishStatus) {
         null -> PublishState.UNSUPPORTED
         "done" -> PublishState.DONE

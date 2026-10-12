@@ -70,6 +70,11 @@ class SessionCloudSummaryTest {
         assertEquals(true, summary(agg(failed = 1), session()).needsRetry)
         assertEquals(true, summary(agg(total = 4, verified = 4), session(synced = 1).copy(exportState = ExportState.FAILED)).needsRetry)
         assertEquals(true, SessionCloudSummary.from(agg(total = 4, verified = 4), session(synced = 1), SessionExportAggregate("s", 3, 2, 1)).needsRetry)
+        val publishFailed = session(synced = 1).copy(publishState = PublishState.FAILED)
+        assertEquals(true, summary(agg(total = 4, verified = 4), publishFailed).needsRetry)
+        assertEquals(true, summary(agg(total = 4, verified = 4), publishFailed).publishFailed)
+        assertEquals(false, summary(agg(total = 4, verified = 4), publishFailed).needsFileRetry)
+        assertEquals(false, summary(agg(total = 4, verified = 4), session(synced = 1).copy(publishState = PublishState.PENDING)).needsRetry)
         assertEquals(false, summary(agg(active = 1), session()).needsRetry)
         assertEquals(false, summary(agg(total = 4, verified = 4), session(synced = 1).copy(exportState = ExportState.DONE)).needsRetry)
     }

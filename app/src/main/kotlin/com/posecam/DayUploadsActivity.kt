@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
+import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
@@ -12,7 +13,6 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import com.posecam.core.cloud.AuthValidation
-import com.posecam.core.cloud.SampleUploads
 import com.posecam.core.cloud.UploadStatsCache
 import com.posecam.core.cloud.UploadStatsText
 import com.posecam.core.cloud.UploadedRecording
@@ -54,6 +54,7 @@ class DayUploadsActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_day_uploads)
+        showBackArrow()
         keepBelowSystemBars()
         sync = CloudSync.get(this)
         cache = UploadStatsCache(this)
@@ -68,6 +69,8 @@ class DayUploadsActivity : Activity() {
         pipeName = { wire -> com.posecam.core.sync.Pipe.fromWire(wire, catalog)?.label }
     }
 
+    override fun onOptionsItemSelected(item: MenuItem): Boolean = handleBackArrow(item) || super.onOptionsItemSelected(item)
+
     override fun onStart() {
         super.onStart()
         load()
@@ -79,11 +82,6 @@ class DayUploadsActivity : Activity() {
     }
 
     private fun load() {
-        // Preview (debug dev menu): the sample recordings arrive with the intent, no server involved.
-        intent.getStringExtra(UploadStatsActivity.EXTRA_PREVIEW_RECORDINGS)?.let(UploadStatsCache.Companion::decodeRecordings)?.let { all ->
-            show(all.filter { it.date == date }, null)
-            return
-        }
         val session = sync.auth.current().session ?: run { finish(); return }
         cache.loadDay(session.email, date)?.let { show(it, "Saved copy") } ?: showNote("Loading\u2026")
         scope.launch {
@@ -91,13 +89,7 @@ class DayUploadsActivity : Activity() {
                 val offset = UploadStatsText.tzOffsetMinutes()
                 val fresh = withContext(Dispatchers.IO) { sync.accounts.uploadsOn(date, offset) }
                 cache.saveDay(session.email, date, fresh)
-                // Debug builds mix the same made-up days into the list as into the day counts (dev menu switch).
-                val sample = if (BuildConfig.DEBUG && getSharedPreferences(UploadStatsActivity.DEBUG_PREFS, MODE_PRIVATE).getBoolean(UploadStatsActivity.KEY_SAMPLE_DAYS, false)) {
-                    SampleUploads.recordingsOn(date, System.currentTimeMillis())
-                } else {
-                    emptyList()
-                }
-                show((fresh + sample).sortedByDescending { it.sessionId }, if (sample.isEmpty()) null else "Sample recordings are mixed in (debug)")
+                show(fresh.sortedByDescending { it.sessionId }, null)
             } catch (cancel: kotlinx.coroutines.CancellationException) {
                 throw cancel
             } catch (failure: Exception) {

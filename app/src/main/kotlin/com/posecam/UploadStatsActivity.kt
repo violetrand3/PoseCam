@@ -6,6 +6,7 @@ import android.app.DatePickerDialog
 import android.content.Intent
 import android.graphics.Typeface
 import android.os.Bundle
+import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
 import android.widget.BaseAdapter
@@ -14,7 +15,6 @@ import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import com.posecam.core.cloud.AuthValidation
-import com.posecam.core.cloud.SampleUploads
 import com.posecam.core.cloud.UploadStats
 import com.posecam.core.cloud.UploadStatsCache
 import com.posecam.core.cloud.UploadStatsText
@@ -43,6 +43,7 @@ class UploadStatsActivity : Activity() {
     private lateinit var sync: CloudSync
     private lateinit var cache: UploadStatsCache
 
+    private lateinit var avatar: TextView
     private lateinit var name: TextView
     private lateinit var account: TextView
     private lateinit var total: TextView
@@ -55,9 +56,11 @@ class UploadStatsActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_upload_stats)
+        showBackArrow()
         keepBelowSystemBars()
         sync = CloudSync.get(this)
         cache = UploadStatsCache(this)
+        avatar = findViewById(R.id.statsAvatar)
         name = findViewById(R.id.statsName)
         account = findViewById(R.id.statsAccount)
         total = findViewById(R.id.statsTotal)
@@ -68,6 +71,8 @@ class UploadStatsActivity : Activity() {
         findViewById<Button>(R.id.statsSignOut).setOnClickListener { confirmSignOut() }
         findViewById<Button>(R.id.statsPickDate).setOnClickListener { pickDate() }
     }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean = handleBackArrow(item) || super.onOptionsItemSelected(item)
 
     override fun onStart() {
         super.onStart()
@@ -80,23 +85,13 @@ class UploadStatsActivity : Activity() {
     }
 
     private fun load() {
-        // Debug builds can show sample data (see the dev menu); nothing in a release build ever sets this extra.
-        intent.getStringExtra(EXTRA_PREVIEW)?.let(UploadStatsCache.Companion::decode)?.let { preview ->
-            account.text = "Preview with sample data"
-            name.text = "Sample Collector"
-            name.visibility = View.VISIBLE
-            show(preview.stats, null)
-            return
-        }
         val session = sync.auth.current().session
         if (session == null) {
             startActivity(Intent(this, AuthActivity::class.java))
             finish()
             return
         }
-        account.text = session.email
-        name.text = session.name
-        name.visibility = if (session.name.isNullOrBlank()) View.GONE else View.VISIBLE
+        showAccount(session.name, session.email)
         cache.load(session.email)?.let { show(it.stats, "Saved copy \u00b7 ${UploadStatsText.age(it.savedAtMs, System.currentTimeMillis()) ?: "just now"}") }
             ?: run { showNote("Loading\u2026") }
         scope.launch {
@@ -104,12 +99,7 @@ class UploadStatsActivity : Activity() {
                 val offset = UploadStatsText.tzOffsetMinutes()
                 val stats = withContext(Dispatchers.IO) { sync.accounts.myStats(offset) }
                 cache.save(stats, System.currentTimeMillis())
-                // Debug builds can mix made-up past days into the real list (dev menu switch); never in a release build.
-                if (BuildConfig.DEBUG && getSharedPreferences(DEBUG_PREFS, MODE_PRIVATE).getBoolean(KEY_SAMPLE_DAYS, false)) {
-                    show(SampleUploads.mixedInto(stats, System.currentTimeMillis()), "Sample days are mixed in (debug)")
-                } else {
-                    show(stats, null)
-                }
+                show(stats, null)
             } catch (cancel: kotlinx.coroutines.CancellationException) {
                 throw cancel
             } catch (failure: Exception) {
@@ -131,6 +121,15 @@ class UploadStatsActivity : Activity() {
         }
     }
 
+    /** The collector's name is the heading; the e-mail sits under it, or is the heading for an account with no name. */
+    private fun showAccount(displayName: String?, email: String) {
+        val title = displayName?.trim().takeUnless { it.isNullOrEmpty() } ?: email
+        name.text = title
+        account.text = email
+        account.visibility = if (title == email) View.GONE else View.VISIBLE
+        avatar.text = title.first().uppercase()
+    }
+
     private fun showNote(text: String?) {
         note.text = text
         note.visibility = if (text.isNullOrBlank()) View.GONE else View.VISIBLE
@@ -150,10 +149,7 @@ class UploadStatsActivity : Activity() {
     }
 
     private fun openDay(date: String) {
-        val open = Intent(this, DayUploadsActivity::class.java).putExtra(DayUploadsActivity.EXTRA_DATE, date)
-        // A preview has no server to ask for the day, so it hands the sample recordings along.
-        intent.getStringExtra(EXTRA_PREVIEW_RECORDINGS)?.let { open.putExtra(EXTRA_PREVIEW_RECORDINGS, it) }
-        startActivity(open)
+        startActivity(Intent(this, DayUploadsActivity::class.java).putExtra(DayUploadsActivity.EXTRA_DATE, date))
     }
 
     /** Jump to any date, including one with nothing on it (the day's screen then says so). */
@@ -207,10 +203,6 @@ class UploadStatsActivity : Activity() {
     }
 
     private fun confirmSignOut() {
-        if (intent.hasExtra(EXTRA_PREVIEW)) {
-            finish()
-            return
-        }
         AlertDialog.Builder(this)
             .setTitle("Sign out?")
             .setMessage("Recordings not yet uploaded stay on this phone and upload to the next account that signs in.")
@@ -221,17 +213,5 @@ class UploadStatsActivity : Activity() {
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
-    }
-
-    companion object {
-        /** Stats as [UploadStatsCache] encodes them: shown instead of asking the server. Used by the debug dev menu. */
-        const val EXTRA_PREVIEW = "preview_stats"
-
-        /** The preview's recordings ([UploadStatsCache.encodeRecordings]), handed on to a day's screen. */
-        const val EXTRA_PREVIEW_RECORDINGS = "preview_recordings"
-
-        /** Debug-only switch (set by the dev menu): add sample past days to the real list. */
-        const val DEBUG_PREFS = "posecam_debug"
-        const val KEY_SAMPLE_DAYS = "sample_past_days"
     }
 }

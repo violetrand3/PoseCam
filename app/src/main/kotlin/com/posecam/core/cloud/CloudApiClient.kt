@@ -169,6 +169,10 @@ class CloudApiClient(
         get(listOf("v1", "sessions", sessionId)).requireObject("session").toSessionView()
     }
 
+    override suspend fun retryPublish(sessionId: String): CloudSessionView = parsing {
+        post(listOf("v1", "sessions", sessionId, "publish", "retry"), JSONObject()).requireObject("session").toSessionView()
+    }
+
     override suspend fun completeSession(
         sessionId: String,
         recordingStatus: String,

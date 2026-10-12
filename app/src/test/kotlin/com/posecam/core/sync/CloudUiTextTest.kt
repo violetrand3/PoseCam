@@ -73,7 +73,7 @@ class CloudUiTextTest {
         assertEquals("Queued · retry: HTTP 500 INTERNAL: boom", queued("HTTP 500 INTERNAL: boom"))
     }
 
-    @Test fun theChosenPipeIsShownWhileTheRecordingIsOnItsWay() {
+    @Test fun theChosenPipeIsShownOnEveryFiledRecording() {
         fun withPipe(status: SessionCloudStatus, waiting: Boolean = false) =
             CloudUiText.rowStatus(summary(status, done = 45, total = 100), SyncPolicy.WIFI_ONLY, waiting, true, "White pipe")
         assertEquals("White pipe · Uploading 45%", withPipe(SessionCloudStatus.UPLOADING))
@@ -81,9 +81,19 @@ class CloudUiTextTest {
         assertEquals("White pipe · Waiting for Wi-Fi", withPipe(SessionCloudStatus.PENDING, waiting = true))
         assertEquals("White pipe · Verifying", withPipe(SessionCloudStatus.VERIFYING))
         assertEquals("White pipe · Upload failed", withPipe(SessionCloudStatus.FAILED))
+        assertEquals("White pipe · Done · live", live(withPipe = "White pipe"))
+        assertEquals("Done · live", live(withPipe = null))
     }
 
-    @Test fun noPipeLabelMeansTheLineIsUnchangedAndSyncedRowsStayShort() {
+    private fun live(withPipe: String?) = CloudUiText.rowStatus(
+        SessionCloudSummary(
+            "capture-x", SessionCloudStatus.SYNCED, 4, 4, 100, 100, null,
+            exportState = ExportState.DONE, publishState = PublishState.DONE, publishedSets = 1,
+        ),
+        SyncPolicy.WIFI_ONLY, false, true, withPipe,
+    )
+
+    @Test fun noPipeLabelMeansTheLineIsUnchanged() {
         assertEquals("Uploading 45%", row(summary(SessionCloudStatus.UPLOADING, done = 45, total = 100)))
         assertEquals(
             "Choose a pipe",

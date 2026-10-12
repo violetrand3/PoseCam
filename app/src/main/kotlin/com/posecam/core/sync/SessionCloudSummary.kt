@@ -36,9 +36,15 @@ data class SessionCloudSummary(
 
     /**
      * Something about this recording failed for good and only a tap will run it again: a file or the cloud session
-     * (shown "Upload failed"), or, once synced, its pipeline export or the upload of it.
+     * (shown "Upload failed"), or, once synced, its pipeline export, the upload of it, or the backend's publishing.
      */
-    val needsRetry: Boolean get() = status == SessionCloudStatus.FAILED || exportState == ExportState.FAILED || exportFilesFailed > 0
+    val needsRetry: Boolean get() = needsFileRetry || publishFailed
+
+    /** A file, the cloud session or the pipeline export failed: [UploadCoordinator.syncSession] with retryFailedFiles runs them again. */
+    val needsFileRetry: Boolean get() = status == SessionCloudStatus.FAILED || exportState == ExportState.FAILED || exportFilesFailed > 0
+
+    /** Everything is uploaded but the backend gave up putting it on the website; only [PublishTracker.retry] asks it to try again. */
+    val publishFailed: Boolean get() = isSynced && publishState == PublishState.FAILED
 
     /** Synced, and the backend made at least one gallery card from it: it can be found on the website. */
     val isLiveOnWebsite: Boolean get() = isSynced && publishState == PublishState.DONE && publishedSets > 0

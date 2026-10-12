@@ -64,6 +64,41 @@ class PublishTrackerTest {
     }
 
     @Test
+    fun retryAsksTheBackendAndShowsPublishingAgainRightAway() = runBlocking {
+        syncedSession()
+        serverSays("failed", error = "ffmpeg exited 1")
+        tracker.checkDue()
+        assertEquals(PublishState.FAILED, session().publishState)
+
+        tracker.retry(id)
+
+        assertEquals(1, f.api.callsTo("retryPublish"))
+        assertEquals(PublishState.PENDING, session().publishState)
+        assertEquals(null, session().publishNote)
+        // The failure schedule is forgotten: the next tick asks the backend about it straight away.
+        serverSays("done", sets = 1)
+        assertEquals(1, tracker.checkDue())
+        assertEquals(PublishState.DONE, session().publishState)
+    }
+
+    @Test
+    fun aFailedRetryChangesNothingAndTellsTheCaller() = runBlocking {
+        syncedSession()
+        serverSays("failed", error = "ffmpeg exited 1")
+        tracker.checkDue()
+        f.api.failOnce("retryPublish", CloudNetworkException(java.io.IOException("offline")))
+
+        try {
+            tracker.retry(id)
+            org.junit.Assert.fail("expected the failure to reach the caller")
+        } catch (expected: CloudNetworkException) {
+        }
+
+        assertEquals(PublishState.FAILED, session().publishState)
+        assertEquals("ffmpeg exited 1", session().publishNote)
+    }
+
+    @Test
     fun aBackendWithoutPublishStatusIsUnsupportedAndNeverAskedAgain() = runBlocking {
         syncedSession()
         serverSays(null)

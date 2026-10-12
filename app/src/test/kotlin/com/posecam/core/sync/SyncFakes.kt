@@ -253,6 +253,11 @@ class FakeCloudApi : CloudApi {
         return publishOnServer[sessionId] ?: view(sessionId).copy(publishStatus = "pending")
     }
 
+    override suspend fun retryPublish(sessionId: String): CloudSessionView {
+        record("retryPublish", sessionId)
+        return view(sessionId).copy(publishStatus = "pending")
+    }
+
     override suspend fun completeSession(sessionId: String, recordingStatus: String, files: List<SessionFileRef>): CloudSessionView {
         record("completeSession", sessionId)
         completedSessions += files

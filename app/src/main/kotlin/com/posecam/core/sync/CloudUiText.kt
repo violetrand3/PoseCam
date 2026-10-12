@@ -9,15 +9,15 @@ object CloudUiText {
         waitingForNetwork: Boolean,
         /** False until the collector has chosen the export rotation: exports wait for it. */
         exportRotationSet: Boolean = true,
-        /** The name of the pipe the recording was filed under; shown while it is on its way to the cloud. */
+        /** The name of the pipe the recording was filed under; shown on every row that has been filed. */
         pipeLabel: String? = null,
     ): String {
         if (summary == null) return "On this phone only"
         val status = summary.displayStatus(waitingForNetwork)
         val line = statusLine(status, summary, policy, exportRotationSet)
-        val inFlight = status == SessionCloudStatus.WAITING_FOR_WIFI || status == SessionCloudStatus.PENDING ||
-            status == SessionCloudStatus.UPLOADING || status == SessionCloudStatus.VERIFYING || status == SessionCloudStatus.FAILED
-        return if (inFlight && !pipeLabel.isNullOrBlank()) "$pipeLabel · $line" else line
+        // Not yet filed (local only, or still waiting for the collector to choose): there is no pipe to name.
+        val filed = status != SessionCloudStatus.LOCAL_ONLY && status != SessionCloudStatus.AWAITING_PIPE
+        return if (filed && !pipeLabel.isNullOrBlank()) "$pipeLabel · $line" else line
     }
 
     private fun statusLine(status: SessionCloudStatus, summary: SessionCloudSummary, policy: SyncPolicy, exportRotationSet: Boolean): String {

@@ -1,12 +1,19 @@
 package com.posecam
 
 import android.app.Activity
+import android.content.Context
+import android.graphics.Rect
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
+import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import com.posecam.core.cloud.AuthValidation
 import com.posecam.core.sync.CloudSync
@@ -15,6 +22,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 /**
  * Email and password sign-in / sign-up. Recording never needs it; uploading does, because every recording is filed under
@@ -36,6 +44,11 @@ class AuthActivity : Activity() {
     private lateinit var submit: Button
     private lateinit var toggle: Button
     private lateinit var progress: ProgressBar
+    private lateinit var scroll: ScrollView
+    private var lastViewportHeight = -1
+    private var tapOutsideFields = false
+    private var tapStartX = 0f
+    private var tapStartY = 0f
 
     private var signingUp = false
     private var busy = false
@@ -54,6 +67,7 @@ class AuthActivity : Activity() {
         submit = findViewById(R.id.authSubmit)
         toggle = findViewById(R.id.authToggle)
         progress = findViewById(R.id.authProgress)
+        scroll = findViewById(R.id.authScroll)
 
         val sync = CloudSync.get(this)
         if (!sync.config.enabled) {
@@ -63,6 +77,7 @@ class AuthActivity : Activity() {
         signingUp = savedInstanceState?.getBoolean(STATE_SIGNING_UP) ?: false
         if (savedInstanceState == null) email.setText(sync.auth.current().lastEmail.orEmpty())
 
+        keepFocusedFieldVisible()
         addShowPasswordToggle(password)
         addShowPasswordToggle(confirm)
         submit.setOnClickListener { submit() }
@@ -83,6 +98,89 @@ class AuthActivity : Activity() {
         render()
     }
 
+    /**
+     * A tap outside every input field closes the keyboard. A tap on another field is left alone, so moving from one field
+     * to the next keeps the keyboard up instead of closing and reopening it. Only a tap counts: a drag that starts outside
+     * the fields is a scroll, and must leave the keyboard open.
+     */
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                tapStartX = event.rawX
+                tapStartY = event.rawY
+                tapOutsideFields = currentFocus is EditText && !isOnAField(event.rawX.toInt(), event.rawY.toInt())
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val slop = ViewConfiguration.get(this).scaledTouchSlop
+                if (abs(event.rawX - tapStartX) > slop || abs(event.rawY - tapStartY) > slop) tapOutsideFields = false
+            }
+            MotionEvent.ACTION_UP -> {
+                if (tapOutsideFields) hideKeyboard()
+                tapOutsideFields = false
+            }
+            MotionEvent.ACTION_CANCEL -> tapOutsideFields = false
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    private fun isOnAField(x: Int, y: Int): Boolean = listOf(name, email, password, confirm).any { field ->
+        field.visibility == View.VISIBLE && Rect().also { field.getGlobalVisibleRect(it) }.contains(x, y)
+    }
+
+    /**
+     * Keeps the field being typed in on screen. The layout already makes room for the keyboard (it pads the bottom of the
+     * scroll view), but the scroll view does not move on its own when the keyboard opens or focus jumps to another field,
+     * so the field, and the button under the last one, could sit behind the keyboard.
+     */
+    private fun keepFocusedFieldVisible() {
+        listOf(name, email, password, confirm).forEach { field ->
+            field.setOnFocusChangeListener { _, hasFocus -> if (hasFocus) revealFocusedField() }
+        }
+        // The keyboard opening or closing changes how much of the scroll view is usable.
+        scroll.viewTreeObserver.addOnGlobalLayoutListener {
+            val viewport = scroll.height - scroll.paddingTop - scroll.paddingBottom
+            if (viewport != lastViewportHeight) {
+                lastViewportHeight = viewport
+                revealFocusedField()
+            }
+        }
+    }
+
+    /** Scrolls just enough to show the focused field; on the last field, the submit button below it too when that fits. */
+    private fun revealFocusedField() {
+        scroll.post {
+            val field = currentFocus as? EditText ?: return@post
+            val content = scroll.getChildAt(0) as ViewGroup
+            val margin = (16 * resources.displayMetrics.density).toInt()
+            val area = Rect().also {
+                field.getDrawingRect(it)
+                content.offsetDescendantRectToMyCoords(field, it)
+            }
+            val lastField = if (signingUp) confirm else password
+            val viewport = scroll.height - scroll.paddingTop - scroll.paddingBottom
+            val withButton = Rect().also {
+                submit.getDrawingRect(it)
+                content.offsetDescendantRectToMyCoords(submit, it)
+            }.bottom + margin
+            area.bottom = if (field === lastField && withButton - area.top <= viewport) withButton else area.bottom + margin
+            area.top -= margin
+            // What is on screen, in the content's own coordinates; move by the least that brings [area] inside it.
+            val shown = scroll.scrollY..(scroll.scrollY + viewport)
+            val delta = when {
+                area.bottom > shown.last -> area.bottom - shown.last
+                area.top < shown.first -> area.top - shown.first
+                else -> 0
+            }
+            if (delta != 0) scroll.smoothScrollBy(0, delta)
+        }
+    }
+
+    private fun hideKeyboard() {
+        val focused = currentFocus ?: return
+        focused.clearFocus()
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(focused.windowToken, 0)
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_SIGNING_UP, signingUp)
@@ -101,7 +199,7 @@ class AuthActivity : Activity() {
     private fun render() {
         title.text = if (signingUp) "Create your account" else "Sign in"
         subtitle.text = if (signingUp) {
-            "Recordings you upload are filed under your account, and the app keeps count of them for you."
+            "Your uploaded recordings are filed under your account, and the app counts them for you."
         } else {
             "Sign in to upload your recordings. You can keep recording without a connection."
         }
@@ -123,6 +221,7 @@ class AuthActivity : Activity() {
 
     private fun submit() {
         if (busy) return
+        hideKeyboard() // so the error, or the spinner, is not hidden behind it
         val address = AuthValidation.normalizeEmail(email.text.toString())
         val secret = password.text.toString()
         val displayName = name.text.toString().trim()

@@ -1,21 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<com.posecam.FormScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/authScroll"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:fillViewport="true">
 
     <LinearLayout
         android:id="@+id/authRoot"
+        android:descendantFocusability="beforeDescendants"
+        android:focusable="true"
+        android:focusableInTouchMode="true"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
         android:padding="24dp">
 
         <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            android:text="PoseCam"
+            android:textColor="#00796B"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
             android:id="@+id/authTitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="24dp"
+            android:layout_marginTop="12dp"
             android:textSize="28sp"
             android:textStyle="bold" />
 
@@ -23,15 +36,21 @@
             android:id="@+id/authSubtitle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginBottom="24dp"
-            android:layout_marginTop="4dp"
+            android:layout_marginBottom="28dp"
+            android:layout_marginTop="8dp"
             android:alpha="0.7"
+            android:lineSpacingExtra="2dp"
             android:textSize="15sp" />
 
         <EditText
             android:id="@+id/authName"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="52dp"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_input"
+            android:paddingEnd="14dp"
+            android:paddingStart="14dp"
+            android:textSize="16sp"
             android:autofillHints="name"
             android:hint="@string/auth_name"
             android:imeOptions="actionNext"
@@ -42,7 +61,12 @@
         <EditText
             android:id="@+id/authEmail"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="52dp"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_input"
+            android:paddingEnd="14dp"
+            android:paddingStart="14dp"
+            android:textSize="16sp"
             android:autofillHints="emailAddress"
             android:hint="@string/auth_email"
             android:imeOptions="actionNext"
@@ -52,7 +76,12 @@
         <EditText
             android:id="@+id/authPassword"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="52dp"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_input"
+            android:paddingEnd="14dp"
+            android:paddingStart="14dp"
+            android:textSize="16sp"
             android:autofillHints="password"
             android:hint="@string/auth_password"
             android:imeOptions="actionNext"
@@ -62,7 +91,11 @@
         <EditText
             android:id="@+id/authConfirm"
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
+            android:layout_height="52dp"
+            android:background="@drawable/bg_input"
+            android:paddingEnd="14dp"
+            android:paddingStart="14dp"
+            android:textSize="16sp"
             android:hint="@string/auth_confirm"
             android:imeOptions="actionDone"
             android:inputType="textPassword"
@@ -72,16 +105,21 @@
             android:id="@+id/authError"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:textColor="#C62828"
+            android:layout_marginTop="4dp"
+            android:textColor="#B3261E"
             android:textSize="14sp"
             android:visibility="gone" />
 
         <Button
             android:id="@+id/authSubmit"
             android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:layout_marginTop="20dp" />
+            android:layout_height="52dp"
+            android:layout_marginTop="16dp"
+            android:background="@drawable/bg_button_primary"
+            android:textAllCaps="false"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:textStyle="bold" />
 
         <ProgressBar
             android:id="@+id/authProgress"
@@ -97,7 +135,9 @@
             style="?android:attr/borderlessButtonStyle"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:textAllCaps="false" />
+            android:layout_marginTop="12dp"
+            android:textAllCaps="false"
+            android:textColor="#00796B"
+            android:textSize="15sp" />
     </LinearLayout>
-</ScrollView>
+</com.posecam.FormScrollView>

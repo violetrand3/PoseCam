@@ -133,9 +133,27 @@ class SessionsCloudUi(
     /** The Retry button on a failed recording's row: runs just that recording's failed parts again. */
     fun retry(sessionId: String) {
         val summary = summaries[sessionId] ?: return
+        if (summary.publishFailed) retryPublish(sessionId)
+        if (!summary.needsFileRetry) return
         confirmMobileData(summary.totalBytes) {
             sync.coordinator.syncSession(sessionId, retryFailedFiles = true)
             Toast.makeText(activity, "Retrying…", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Asks the backend to put a recording it could not publish back in its queue. The files are already uploaded, so
+     * this sends nothing but one small request (no mobile-data question).
+     */
+    private fun retryPublish(sessionId: String) {
+        scope.launch {
+            val message = try {
+                withContext(Dispatchers.IO) { sync.publishTracker.retry(sessionId) }
+                "Publishing again…"
+            } catch (error: com.posecam.core.cloud.CloudException) {
+                "Could not retry publishing: ${(error as? com.posecam.core.cloud.CloudHttpException)?.reason ?: error.message}"
+            }
+            Toast.makeText(activity, message, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -151,7 +169,10 @@ class SessionsCloudUi(
         renderBulkActions()
         retryAll.text = "Retry failed (${failed.size})"
         retryAll.setOnClickListener {
-            confirmMobileData(failed.sumOf { it.totalBytes }) {
+            failed.filter { it.publishFailed }.forEach { retryPublish(it.sessionId) }
+            val fileRetries = failed.filter { it.needsFileRetry }
+            if (fileRetries.isEmpty()) return@setOnClickListener
+            confirmMobileData(fileRetries.sumOf { it.totalBytes }) {
                 sync.coordinator.retryFailed(null)
                 Toast.makeText(activity, "Retrying ${failed.size} recordings…", Toast.LENGTH_SHORT).show()
             }
@@ -203,6 +224,9 @@ class SessionsCloudUi(
                 AlertDialog.Builder(activity).setTitle("Not on the website").setMessage(detail)
                     .setPositiveButton(R.string.close, null).show()
             }
+        }
+        if (summary.publishFailed) {
+            actions += Action("Retry publish") { retryPublish(sessionId) }
         }
         CloudUiText.missingExportDetail(summary)?.let { detail ->
             actions += Action("Why no pipeline export?") {
