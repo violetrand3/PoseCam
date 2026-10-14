@@ -14,6 +14,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -28,10 +29,16 @@ class RecordingToUploadIntegrationTest {
     private val f = SyncFixture()
     private val scheduler = FakeScheduler()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val coordinator = UploadCoordinator(f.repo, scheduler, f.staging, scope)
+    /** The campaign chosen on the capture screen before Record; collecting raw data, so frames travel too. */
+    private val campaign = ActiveCampaign(SyncFixture.CAMPAIGN, "Kitchen tidy", collectRaw = true)
+    private val coordinator = UploadCoordinator(
+        f.repo, scheduler, f.staging, scope, accountId = { SyncFixture.ACCOUNT }, activeCampaign = { campaign },
+    )
 
     // The real gate (ActiveRecordingSessions), unlike SyncFixture's switch.
-    private val processor = UploadProcessor(f.repo, f.api, f.s3, FileHasher(), { "install-1" }, "test", f.materializer)
+    private val processor = UploadProcessor(
+        f.repo, f.api, f.s3, FileHasher(), { "install-1" }, "test", f.materializer, account = AccountScope.fixed(SyncFixture.ACCOUNT),
+    )
 
     /** Distinct, timestamp-derived bytes per frame, so a mix-up between frames is visible. */
     private val encoder = FrameEncoder { image, out -> out.writeBytes(ByteArray(64 + (image.timestampNs % 29).toInt()) { (image.timestampNs + it).toByte() }) }
@@ -39,7 +46,11 @@ class RecordingToUploadIntegrationTest {
     private val t = floatArrayOf(0f, 0f, 0f)
     private val q = floatArrayOf(0f, 0f, 0f, 1f)
 
-    init { f.api.multipartThreshold = Long.MAX_VALUE }
+    init {
+        f.api.multipartThreshold = Long.MAX_VALUE
+        f.dao.defaultPipe = null // production: the coordinator files a take under the campaign that was active when it began
+        f.dao.defaultAccountId = null
+    }
 
     @After fun tearDown() {
         scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
@@ -106,24 +117,33 @@ class RecordingToUploadIntegrationTest {
     }
 
     @Test
-    fun aFinishedTakeWaitsForThePipeChoiceAndThenUploadsIntoThatPipe() = runBlocking {
-        f.dao.defaultPipe = null // production: no pipe until the collector taps White pipe / Black pipe
-        val dir = recordTake(60)
+    fun aGoodTakeIsUploadedUnderTheActiveCampaignWithoutAskingAnything() = runBlocking {
+        val dir = recordTake(200) // about 6.7 s: long enough to be a good take
         val id = dir.name
         until { f.repo.session(id)?.recordingFinal == true }
 
-        // "Take looks good" is on screen and the collector has not chosen yet: nothing may leave the phone.
-        assertEquals(QueueRunResult.DONE, processor.runQueue())
-        assertEquals(0, f.api.calls.size)
-        assertEquals(0, f.s3.puts.size)
-
-        coordinator.choosePipe(id, Pipe.BLACK)
-        until { f.repo.session(id)?.pipe == "black" }
+        assertEquals(SyncFixture.CAMPAIGN, f.repo.session(id)!!.pipe)
+        assertEquals(SyncFixture.ACCOUNT, f.repo.session(id)!!.accountId)
         assertEquals(QueueRunResult.DONE, processor.runQueue())
 
-        assertEquals("black", f.api.createdPipes[id])
+        assertEquals(SyncFixture.CAMPAIGN, f.api.createdCampaigns[id])
+        assertEquals("good", f.api.createdRequests.single().take!!.verdict)
         assertNotNull(f.repo.session(id)!!.syncedAt)
         assertTrue(f.s3.puts.isNotEmpty())
+    }
+
+    @Test
+    fun aShortTakeIsARedoAndNeverLeavesThePhone() = runBlocking {
+        val dir = recordTake(60) // 2 s: "Better to record this one again"
+        val id = dir.name
+        until { f.repo.session(id)?.recordingFinal == true }
+
+        assertEquals(QueueRunResult.DONE, processor.runQueue())
+
+        assertNull(f.repo.session(id)!!.pipe)
+        assertEquals(0, f.api.calls.size)
+        assertEquals(0, f.s3.puts.size)
+        assertTrue(f.repo.uploadsForSession(id).isEmpty())
     }
 
     @Test
@@ -131,7 +151,8 @@ class RecordingToUploadIntegrationTest {
         // An older, finished recording is waiting in the queue when the user starts a new take.
         val older = f.sessionDir("capture-20260101T000000-000001")
         f.frames(older, 30)
-        f.repo.finalizeSession(older.name, older, "complete", UploadPlan.forSession(older.name, older, f.staging))
+        f.repo.registerSession(older.name, older, SyncFixture.CAMPAIGN, rawRequired = true, accountId = SyncFixture.ACCOUNT)
+        f.repo.finalizeSession(older.name, older, "complete", UploadPlan.forSession(older.name, older, f.staging, includeRaw = true))
         f.repo.markSessionCreated(older.name)
 
         val recorder = PoseRecorder(f.capturesRoot, encoder, listener = coordinator)
@@ -148,16 +169,17 @@ class RecordingToUploadIntegrationTest {
         // The take being written is never queued or touched until it is finalized.
         assertTrue(f.repo.uploadsForSession(dir.name).isEmpty())
 
+        // A real take is short here (one frame), i.e. a redo: it is finalized and queued for nothing.
         recorder.stop()
         until { !ActiveRecordingSessions.contains(dir.name) && f.repo.session(dir.name)?.recordingFinal == true }
-        until { scheduler.scheduled >= 1 } // queued for upload as soon as it is finalized
+        until { scheduler.scheduled >= 1 } // the queue is kicked as soon as it is finalized
 
         assertEquals(QueueRunResult.DONE, processor.runQueue())
-        assertNotNull(f.repo.session(dir.name)!!.syncedAt)
+        assertTrue(f.repo.uploadsForSession(dir.name).isEmpty())
     }
 
     @Test
-    fun aTakeKilledMidRecordingIsAdoptedByRecoveryAsIncomplete() = runBlocking {
+    fun aTakeKilledMidRecordingIsAdoptedByRecoveryButNeverUploaded() = runBlocking {
         // Simulate a crash: the recorder started (manifest complete:false on disk) and the process died.
         val recorder = PoseRecorder(f.capturesRoot, encoder, listener = null)
         val dir = recorder.start(emptyMap())
@@ -166,10 +188,12 @@ class RecordingToUploadIntegrationTest {
         assertTrue(File(dir, "manifest.json").readText().contains("\"complete\": false"))
 
         UploadQueueRecovery(f.capturesRoot, f.repo, scheduler, f.staging) { false }.run()
-        f.api.multipartThreshold = Long.MAX_VALUE
         assertEquals(QueueRunResult.DONE, processor.runQueue())
 
-        assertEquals("incomplete", f.api.completedStatuses.single())
-        assertNotNull(f.repo.session(dir.name)!!.syncedAt)
+        // The marketplace never accepts an incomplete recording, so the app does not even offer it.
+        assertEquals(0, f.api.calls.size)
+        assertNull(f.repo.session(dir.name)!!.syncedAt)
+        assertTrue(f.repo.uploadsForSession(dir.name).isEmpty())
+        assertEquals("incomplete", SessionManifestInfo.read(dir)!!.recordingStatus)
     }
 }

@@ -12,6 +12,9 @@ import java.io.File
  */
 object CloudFileRules {
     private val METADATA = setOf("manifest.json", "device.json", "intrinsics.json")
+
+    /** The two metadata files every upload has; `intrinsics.json` belongs to the raw data. */
+    private val ALWAYS = setOf("manifest.json", "device.json")
     private val TABLES = setOf("poses.csv", "frame_metadata.csv")
     private const val IMU = "imu.csv"
     private val CHUNK = Regex("""^frames-[0-9]{5,6}\.zip$""")
@@ -37,13 +40,22 @@ object CloudFileRules {
     fun isUploadable(relativePath: String): Boolean = classify(relativePath) != null
 
     /**
-     * A session is only SYNCED (and later cleanup-eligible) once every required file is verified.
-     * Pipeline exports are derived from the raw recording and can appear later, so they do not hold that up.
+     * Whether [relativePath] holds up SYNCED. Always required: `manifest.json`, `device.json` and the pipeline export (for
+     * every segment the exporter produced). The raw data -- `intrinsics.json`, `poses.csv`, `frame_metadata.csv`,
+     * `imu.csv` and the frame chunks -- is required only when the campaign collects it ([rawRequired]); otherwise it is
+     * not uploaded at all. [classify] (the allow-list) does not depend on the session.
      */
-    fun isRequired(relativePath: String): Boolean {
+    fun isRequired(relativePath: String, rawRequired: Boolean): Boolean {
         val type = classify(relativePath) ?: return false
-        return type != UploadFileType.EXPORT
+        return when {
+            type == UploadFileType.EXPORT -> true
+            relativePath in ALWAYS -> true
+            else -> rawRequired
+        }
     }
+
+    /** True for the files that are only uploaded when the campaign collects raw data. */
+    fun isRaw(relativePath: String): Boolean = classify(relativePath) != null && !isRequired(relativePath, false)
 
     /** The backend refuses any other id for good, so such a folder must never enter the queue. */
     fun isValidSessionId(sessionId: String): Boolean = SESSION_ID.matches(sessionId)

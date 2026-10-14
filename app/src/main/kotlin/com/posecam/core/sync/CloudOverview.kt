@@ -72,8 +72,15 @@ data class CloudOverview(
                     SessionCloudStatus.UPLOADING, SessionCloudStatus.VERIFYING -> syncing += summary
                     SessionCloudStatus.PENDING, SessionCloudStatus.WAITING_FOR_WIFI -> waiting += summary
                     SessionCloudStatus.SYNCED -> synced++
-                    // Not "waiting": nothing is queued to be sent until the collector chooses a pipe.
-                    SessionCloudStatus.LOCAL_ONLY, SessionCloudStatus.AWAITING_PIPE -> Unit
+                    // Not "waiting": nothing is queued to be sent until the collector chooses a campaign, and another
+                    // account's recordings are not this collector's to upload.
+                    SessionCloudStatus.LOCAL_ONLY, SessionCloudStatus.AWAITING_CAMPAIGN, SessionCloudStatus.OTHER_ACCOUNT -> Unit
+                    // The export is on its way (waiting), crashed (needs a retry), or can never exist (nothing to wait for).
+                    SessionCloudStatus.EXPORT_BLOCKED -> when (summary.exportState) {
+                        ExportState.PENDING -> waiting += summary
+                        ExportState.FAILED -> failed++
+                        else -> Unit
+                    }
                 }
             }
             val shown = syncing.ifEmpty { waiting }

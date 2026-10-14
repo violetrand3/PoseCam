@@ -14,7 +14,7 @@ object AuthValidation {
      * Null when the form can be submitted; otherwise the first thing to fix. [confirm] is null when signing in; [name]
      * is null when signing in and required (not blank) when signing up.
      */
-    fun problem(email: String, password: String, confirm: String?, name: String? = null): String? = when {
+    fun problem(email: String, password: String, confirm: String?, name: String? = null, termsAccepted: Boolean = true): String? = when {
         confirm != null && name.isNullOrBlank() -> "Enter your name."
         confirm != null && name!!.trim().length > MAX_NAME -> "The name is too long ($MAX_NAME characters at most)."
         email.isBlank() -> "Enter your email."
@@ -23,6 +23,7 @@ object AuthValidation {
         confirm != null && password.length < MIN_PASSWORD -> "Use at least $MIN_PASSWORD characters for the password."
         password.length > MAX_PASSWORD -> "The password is too long ($MAX_PASSWORD characters at most)."
         confirm != null && confirm != password -> "The two passwords don't match."
+        confirm != null && !termsAccepted -> "Tick the box to accept the Terms and Privacy Policy."
         else -> null
     }
 
@@ -32,8 +33,20 @@ object AuthValidation {
         is CloudHttpException -> when {
             error.status >= 500 -> "The server had a problem. Try again in a moment."
             error.code == "MALFORMED_RESPONSE" -> "The server sent something unexpected. Try again in a moment."
-            else -> error.reason.replaceFirstChar { it.uppercase() }
+            // The marketplace names the form fields that are wrong: show them, not just "validation failed".
+            error.fieldErrors.isNotEmpty() -> fieldErrorLines(error.fieldErrors)
+            else -> error.userMessage.replaceFirstChar { it.uppercase() }
         }
         else -> "Something went wrong: ${error.message ?: error.javaClass.simpleName}"
     }
+
+    /** `fieldErrors` as one line per field, in field order ("Email: Already in use"); a field the form does not know keeps its own name. */
+    fun fieldErrorLines(fieldErrors: Map<String, String>): String = fieldErrors.entries.sortedBy { it.key }.joinToString("\n") { (field, text) ->
+        val label = FIELD_LABELS[field] ?: field.replaceFirstChar { it.uppercase() }
+        "$label: ${text.trim()}"
+    }
+
+    private val FIELD_LABELS = mapOf(
+        "email" to "Email", "password" to "Password", "name" to "Name", "termsVersion" to "Terms", "role" to "Account type",
+    )
 }

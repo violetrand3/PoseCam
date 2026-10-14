@@ -77,11 +77,11 @@ class PrioritizeSessionTest {
         queue("a"); queue("b"); queue("c")
         f.repo.prioritizeSession("c")
 
-        val first = f.repo.runnable().first()
+        val first = f.repo.runnable(SyncFixture.ACCOUNT).first()
 
         assertEquals("c", first.sessionId)
         // Other sessions keep their relative order behind it.
-        assertEquals(listOf("c", "c", "a", "a", "b", "b"), f.repo.runnable().map { it.sessionId })
+        assertEquals(listOf("c", "c", "a", "a", "b", "b"), f.repo.runnable(SyncFixture.ACCOUNT).map { it.sessionId })
     }
 
     @Test
@@ -91,14 +91,14 @@ class PrioritizeSessionTest {
         f.repo.prioritizeSession("a")
         f.repo.prioritizeSession("b")
 
-        assertEquals(listOf("b", "b", "a", "a"), f.repo.runnable().map { it.sessionId })
+        assertEquals(listOf("b", "b", "a", "a"), f.repo.runnable(SyncFixture.ACCOUNT).map { it.sessionId })
     }
 
     @Test
     fun finishedFilesAreNotReorderedAndNothingBreaksForAnUnknownSession() = runBlocking {
         queue("a")
         f.repo.prioritizeSession("does-not-exist")
-        assertEquals(2, f.repo.runnable().size)
+        assertEquals(2, f.repo.runnable(SyncFixture.ACCOUNT).size)
     }
 
     @Test

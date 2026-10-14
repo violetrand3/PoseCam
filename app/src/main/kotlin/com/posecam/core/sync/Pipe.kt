@@ -1,12 +1,11 @@
 package com.posecam.core.sync
 
 /**
- * The folder a recording is filed under in the cloud (`<prefix>/<wire>-pipe/<sessionId>/...`). The collector picks one
- * in the end-of-take dialog; until they do, the recording is not uploaded.
- *
- * The backend owns the list (`GET /v1/pipes`, kept by [PipeCatalog]), so a new colour needs no app release: a pipe is just
- * its [wire] id plus what to show for it. [DEFAULTS] are the three the app has always known, used until the first fetch
- * succeeds and whenever the cached list is unusable. Pipes are equal when their [wire] ids are: the label is display only.
+ * What a recording is filed under. It used to be one of LabelNow's pipes (white / black / black-white); it is now a
+ * marketplace campaign: [wire] is the campaign id (a lowercase UUID, still what is stored in the `cloud_sessions.pipe`
+ * column and sent to the backend, as `campaignId`) and [label] is the campaign's title. The collector's accepted campaigns
+ * come from the backend (`GET /v1/me/campaigns`, kept by [CampaignCatalog]); [DEFAULTS] is empty on purpose: with no
+ * campaign known there is nothing to upload a recording for. Equal when the [wire] ids are: the label is display only.
  */
 class Pipe(val wire: String, val label: String, val color: Int? = null) {
     override fun equals(other: Any?): Boolean = other is Pipe && other.wire == wire
@@ -18,9 +17,15 @@ class Pipe(val wire: String, val label: String, val color: Int? = null) {
         val BLACK = Pipe("black", "Black pipe", 0xFF111827.toInt())
         val BLACK_WHITE = Pipe("black-white", "Black/White pipe", 0xFF9CA3AF.toInt())
 
-        val DEFAULTS: List<Pipe> = listOf(WHITE, BLACK, BLACK_WHITE)
+        /** No campaign known means no cloud upload; recording to the phone itself does not depend on it. */
+        val DEFAULTS: List<Pipe> = emptyList()
 
-        /** The wire id is also an S3 folder name, so it is lowercase words joined by single hyphens. */
+        /** The values older app versions stored in the same column. They name no campaign: the recording must be filed again. */
+        private val LEGACY_WIRES = setOf(WHITE.wire, BLACK.wire, BLACK_WHITE.wire)
+
+        fun isLegacyPipe(value: String?): Boolean = value in LEGACY_WIRES
+
+        /** A campaign id is a lowercase UUID, which is also a lowercase word joined by single hyphens. */
         fun isValidWire(value: String): Boolean = WIRE_RE.matches(value)
 
         /** "White pipes" -> "White pipe": the server names the category, the phone names one pipe. */

@@ -5,8 +5,9 @@ import org.junit.Test
 
 class SessionCloudSummaryTest {
     private fun session(
-        synced: Long? = null, final: Boolean = true, failed: Boolean = false, created: Boolean = true, pipe: String? = "white",
-    ) = CloudSessionEntity("s", "/x", "complete", final, created, failed, synced, null, 0, 0, pipe)
+        synced: Long? = null, final: Boolean = true, failed: Boolean = false, created: Boolean = true, pipe: String? = "c-kitchen",
+        export: ExportState = ExportState.DONE, account: String? = "acct-1",
+    ) = CloudSessionEntity("s", "/x", "complete", final, created, failed, synced, null, 0, 0, pipe, exportState = export, accountId = account)
 
     private fun agg(total: Int = 4, verified: Int = 0, failed: Int = 0, active: Int = 0, awaiting: Int = 0) =
         SessionUploadAggregate("s", total, verified, failed, active, awaiting, 400, 100, null)
@@ -49,20 +50,50 @@ class SessionCloudSummaryTest {
         assertEquals(SessionCloudStatus.PENDING, status(null, session(created = false, final = false)))
     }
 
-    @Test fun aRecordingWithoutAPipeAwaitsTheCollectorsChoiceAndNothingElse() {
-        assertEquals(SessionCloudStatus.AWAITING_PIPE, status(agg(), session(created = false, pipe = null)))
-        assertEquals(SessionCloudStatus.AWAITING_PIPE, status(null, session(created = false, final = false, pipe = null)))
+    @Test fun aRecordingWithoutACampaignAwaitsTheCollectorsChoiceAndNothingElse() {
+        assertEquals(SessionCloudStatus.AWAITING_CAMPAIGN, status(agg(), session(created = false, pipe = null)))
+        assertEquals(SessionCloudStatus.AWAITING_CAMPAIGN, status(null, session(created = false, final = false, pipe = null)))
     }
 
-    @Test fun choosingAPipeMakesItPendingAndAFailureOrSyncStillWins() {
-        assertEquals(SessionCloudStatus.PENDING, status(agg(), session(created = false, pipe = "black")))
+    @Test fun choosingACampaignMakesItPendingAndAFailureOrSyncStillWins() {
+        assertEquals(SessionCloudStatus.PENDING, status(agg(), session(created = false, pipe = "c-laundry")))
         assertEquals(SessionCloudStatus.FAILED, status(agg(failed = 1), session(created = false, pipe = null)))
         assertEquals(SessionCloudStatus.SYNCED, status(agg(verified = 4), session(synced = 1, created = false, pipe = null)))
     }
 
-    @Test fun theChosenPipeIsCarriedToTheUi() {
-        assertEquals("white", SessionCloudSummary.from(agg(), session()).pipe)
+    @Test fun theChosenCampaignAndAccountAreCarriedToTheUi() {
+        assertEquals("c-kitchen", SessionCloudSummary.from(agg(), session()).pipe)
+        assertEquals("acct-1", SessionCloudSummary.from(agg(), session()).accountId)
         assertEquals(null, SessionCloudSummary.from(agg(), session(pipe = null, created = false)).pipe)
+    }
+
+    @Test fun aRecordingWithEverythingUploadedButNoExportIsNeverVerifyingOrSynced() {
+        for (state in listOf(ExportState.PENDING, ExportState.OFF_PROTOCOL, ExportState.NOT_EXPORTABLE, ExportState.FAILED)) {
+            assertEquals(state.name, SessionCloudStatus.EXPORT_BLOCKED, status(agg(total = 2, verified = 2), session(export = state)))
+        }
+        assertEquals(SessionCloudStatus.VERIFYING, status(agg(total = 2, verified = 2), session(export = ExportState.DONE)))
+        // A crashed export is the kind a tap can fix.
+        assertEquals(true, SessionCloudSummary.from(agg(total = 2, verified = 2), session(export = ExportState.FAILED)).needsFileRetry)
+    }
+
+    @Test fun anotherAccountsRecordingReadsBelongsToAnotherAccountUnlessItIsAlreadySynced() {
+        val pending = SessionCloudSummary.from(agg(), session(account = "acct-2"))
+        assertEquals(SessionCloudStatus.OTHER_ACCOUNT, pending.forAccount("acct-1").status)
+        assertEquals(SessionCloudStatus.PENDING, pending.forAccount("acct-2").status)
+        assertEquals(SessionCloudStatus.PENDING, pending.forAccount(null).status) // nobody signed in: unchanged
+        val synced = SessionCloudSummary.from(agg(verified = 4), session(synced = 1, account = "acct-2"))
+        assertEquals(SessionCloudStatus.SYNCED, synced.forAccount("acct-1").status)
+        val unowned = SessionCloudSummary.from(agg(), session(account = null))
+        assertEquals(SessionCloudStatus.PENDING, unowned.forAccount("acct-1").status)
+    }
+
+    @Test fun theMarketplaceVerdictIsCarriedAndANotCountedRecordingIsStillSynced() {
+        val view = SessionCloudSummary.from(
+            agg(verified = 4), session(synced = 1).copy(marketplaceStatus = "NOT_COUNTED", marketplaceReason = "CAMPAIGN_FULL"),
+        )
+        assertEquals(SessionCloudStatus.SYNCED, view.status)
+        assertEquals(true, view.notCounted)
+        assertEquals("CAMPAIGN_FULL", view.marketplaceReason)
     }
 
     @Test fun failedUploadsAndFailedExportsNeedARetry() {

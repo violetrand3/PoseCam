@@ -10,7 +10,7 @@ data class CleanupReport(val deletedSessions: List<String>, val freedBytes: Long
 data class SyncedOverview(
     val deletableSessions: List<String>,
     val deletableBytes: Long,
-    /** Synced, but still needed: waiting to reach the website, or for their pipeline export to be made and uploaded. */
+    /** Synced, but still needed: for a backend that reports publishing, until it has; or for their pipeline export to be made and uploaded. */
     val keptBack: Int,
 )
 
@@ -37,10 +37,12 @@ enum class RetentionBlock {
  * Decides when a recording's local copy may be removed. Deliberately conservative:
  *
  *  * Only sessions the backend has confirmed SYNCED, whose recording is finalized, and whose
- *    every required file is VERIFIED -- and whose local files still match what was verified --
- *    are ever eligible. LOCAL_ONLY, PENDING, UPLOADING and FAILED sessions are never touched.
- *  * Only after the backend has put them on the website, so the collector can see every recording there before its local
- *    copy goes ([PublishState]); a recording it failed to publish stays until that is sorted out.
+ *    every required file is VERIFIED -- the pipeline export included, and the raw data too when the campaign collects it
+ *    -- and whose local files still match what was verified, are ever eligible. LOCAL_ONLY, PENDING, UPLOADING and FAILED
+ *    sessions are never touched. When the campaign does not collect raw data, the raw frames were intentionally not
+ *    uploaded and count as covered; when it does, the frames must all be inside verified chunks, as always.
+ *  * A backend that reports publishing (LabelNow's) must have published the recording first ([PublishState]); the
+ *    marketplace does not, so [PublishState.UNSUPPORTED] is the normal case and a synced recording is deletable at once.
  *  * Even then they are kept for [retentionDays] (default 7), unless the phone is short on
  *    storage, in which case the oldest synced sessions go first until the pressure is gone.
  *  * A recording whose pipeline export is still to be made, or still on its way to the cloud, stays: the raw frames
@@ -153,9 +155,14 @@ class LocalRetentionManager(
         // file created or changed after the sync (and so never uploaded) is not deleted with it.
         val verified = rows.filter { it.state == UploadState.VERIFIED }.associateBy { it.relativePath }
         val uncovered = CloudFileRules.listPlainUploadable(directory).any { file ->
-            CloudFileRules.isRequired(file.name) && verified[file.name]?.sizeBytes != file.length()
+            CloudFileRules.isRequired(file.name, session.rawRequired) && verified[file.name]?.sizeBytes != file.length()
         }
         if (uncovered) return RetentionBlock.LOCAL_FILE_NOT_COVERED
+
+        // The campaign does not collect raw data: the raw files and frames were intentionally never uploaded, so what is
+        // on the phone is "covered" by the verified export. (The backend confirmed SYNCED, which for such a campaign
+        // means manifest, device and the export are all there.)
+        if (!session.rawRequired) return null
 
         // The JPEGs are not plain files: they live inside verified chunk zips. Every JPEG on disk must be in one,
         // so a frame that exists locally but is in no verified chunk blocks deletion.

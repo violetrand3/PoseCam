@@ -78,7 +78,7 @@ class UploadWorker(
     /** Keeps the ongoing notification current (at most about once a second). */
     @OptIn(FlowPreview::class)
     private suspend fun trackProgress(sync: CloudSync) {
-        sync.repository.observeSummaries().sample(1_000).collect { summaries ->
+        sync.observeSummaries().sample(1_000).collect { summaries ->
             val overview = CloudOverview.from(summaries.values, sync.settings.policy, waitingForNetwork = false)
             if (overview.isBusy) sync.notifier.updateProgress(overview)
         }
@@ -87,7 +87,7 @@ class UploadWorker(
     /** Raises the user-facing events for this run: all-synced, failed, stalled. */
     private suspend fun announce(sync: CloudSync, report: QueueRunReport) {
         runCatching {
-            val summaries = sync.repository.observeSummaries().first().values
+            val summaries = sync.observeSummaries().first().values
             val overview = CloudOverview.from(summaries, sync.settings.policy, waitingForNetwork = false)
             sync.announcer.evaluate(overview, report.sessionsSynced, report.result).forEach { sync.notifier.announce(it) }
         }.onFailure { CloudLog.e("announce_failed", it) }

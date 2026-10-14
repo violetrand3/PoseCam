@@ -8,8 +8,8 @@ enum class CloudCardAction {
     /** Some files failed: retry them now. */
     RETRY,
 
-    /** The recording has no pipe yet: offer "White pipe" / "Black pipe". */
-    CHOOSE_PIPE,
+    /** The recording has no campaign yet: offer the campaign chooser. */
+    CHOOSE_CAMPAIGN,
 
     /** Nothing to start: just tell the user the state. */
     INFO,
@@ -18,11 +18,11 @@ enum class CloudCardAction {
     companion object {
         fun forStatus(status: SessionCloudStatus, recordingInProgress: Boolean): CloudCardAction = when {
             recordingInProgress -> INFO
-            status == SessionCloudStatus.AWAITING_PIPE -> CHOOSE_PIPE
+            status == SessionCloudStatus.AWAITING_CAMPAIGN -> CHOOSE_CAMPAIGN
             status == SessionCloudStatus.FAILED -> RETRY
             status == SessionCloudStatus.LOCAL_ONLY || status == SessionCloudStatus.PENDING ||
                 status == SessionCloudStatus.WAITING_FOR_WIFI -> START
-            else -> INFO // uploading, verifying, synced
+            else -> INFO // uploading, verifying, synced, another account's, waiting on the export
         }
 
         /** The message for an [INFO] tap. */
@@ -39,6 +39,7 @@ enum class CloudCardAction {
             }
             status == SessionCloudStatus.VERIFYING -> "Verifying the upload…"
             status == SessionCloudStatus.SYNCED -> "Synced to the cloud"
+            status == SessionCloudStatus.OTHER_ACCOUNT -> "This recording belongs to another account. It uploads when that account signs in."
             else -> ""
         }
     }

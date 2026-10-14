@@ -1,6 +1,5 @@
 package com.posecam.core.cloud
 
-import com.posecam.core.sync.Pipe
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
@@ -31,66 +30,72 @@ object UploadStatsText {
         /** "Today", "Yesterday" or "Tue 6 Oct 2026". */
         val title: String,
         val count: Int,
-        /** The day's split by pipe, biggest first: "White 40 \u00b7 Black 35 \u00b7 Pink 25". */
-        val pipes: String,
-        /** What is not live yet ("2 publishing \u00b7 1 failed"), or empty when the whole day is live. */
-        val attention: String,
-        /** True when something that day failed to publish: shown in red. */
-        val hasFailed: Boolean,
+        /** The day's split by campaign, biggest first: "Kitchen 40 \u00b7 Laundry 35". */
+        val campaigns: String,
     )
 
-    /** The day list: one row per day, each with its pipe split. [pipeName] turns a pipe id into a short name. */
-    fun dayRows(stats: UploadStats, today: String, pipeName: (wire: String) -> String?): List<DayRow> = stats.days.map { day ->
+    /** The day list: one row per day, each with its campaign split. [campaignName] turns a campaign id into its title. */
+    fun dayRows(stats: UploadStats, today: String, campaignName: (id: String) -> String?): List<DayRow> = stats.days.map { day ->
         DayRow(
             date = day.date,
             title = dayLabel(day.date, today),
             count = day.recordings,
-            pipes = pipeSplit(day.pipes, pipeName),
-            attention = listOfNotNull(
-                "${day.publishing} publishing".takeIf { day.publishing > 0 },
-                "${day.failed} failed".takeIf { day.failed > 0 },
-            ).joinToString(" \u00b7 "),
-            hasFailed = day.failed > 0,
+            campaigns = campaignSplit(day.campaigns, campaignName),
         )
     }
 
-    /** "White 40 \u00b7 Black 35": biggest first, ties by name, so the line never reorders itself between visits. */
-    fun pipeSplit(pipes: Map<String, Int>, pipeName: (wire: String) -> String?): String =
-        pipes.entries
+    /** "Kitchen 40 \u00b7 Laundry 35": biggest first, ties by name, so the line never reorders itself between visits. */
+    fun campaignSplit(campaigns: Map<String, Int>, campaignName: (id: String) -> String?): String =
+        campaigns.entries
             .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
-            .joinToString(" \u00b7 ") { "${shortPipe(pipeName(it.key) ?: it.key)} ${it.value}" }
+            .joinToString(" \u00b7 ") { "${campaignName(it.key) ?: it.key} ${it.value}" }
 
-    /** "White pipes" / "White pipe" -> "White": in a list of pipes the word is noise. */
-    fun shortPipe(label: String): String = Pipe.short(label).removeSuffix(" pipe").ifBlank { label }
+    /** The second line of a recording in a day's list: "Kitchen \u00b7 Uploaded". */
+    fun recordingDetail(r: UploadedRecording, campaignName: (id: String) -> String?): String {
+        val campaign = campaignName(r.campaignId) ?: r.campaignTitle.ifBlank { "" }
+        return listOf(campaign, status(r.status)).filter { it.isNotBlank() }.joinToString(" \u00b7 ")
+    }
 
-    /** The second line of a recording in a day's list: "White pipe \u00b7 Live". */
-    fun recordingDetail(r: UploadedRecording, pipeName: (wire: String) -> String?): String {
-        val pipe = Pipe.short(pipeName(r.pipe) ?: r.pipeLabel.ifBlank { r.pipe })
-        return listOf(pipe, status(r.status)).filter { it.isNotBlank() }.joinToString(" \u00b7 ")
+    /**
+     * The small line under a recording once the marketplace has an opinion on it ("In review", "Approved", "Not counted"),
+     * or null while the backend does not say (an older backend, or a cached copy).
+     */
+    fun reviewLine(r: UploadedRecording): String? = r.marketplaceStatus?.let { marketplaceLabel(it, null) }
+
+    /** Plain words for `marketplace.status`, with the reason of a recording that was not counted. */
+    fun marketplaceLabel(status: String, reason: String?): String = when (status) {
+        "CHECKING" -> "Checking"
+        "IN_REVIEW" -> "In review"
+        "APPROVED" -> "Approved"
+        "REJECTED" -> if (reason.isNullOrBlank()) "Rejected" else "Rejected: $reason"
+        "NOT_COUNTED" -> notCountedLabel(reason)
+        else -> status.lowercase().replaceFirstChar { it.uppercase() }.replace('_', ' ')
+    }
+
+    /** "Not counted: campaign full" / "...: campaign closed" / "...: already uploaded". */
+    fun notCountedLabel(reason: String?): String = when (reason) {
+        "CAMPAIGN_FULL" -> "Not counted: campaign full"
+        "CAMPAIGN_CLOSED" -> "Not counted: campaign closed"
+        "DUPLICATE" -> "Not counted: duplicate recording"
+        else -> "Not counted"
     }
 
     /** The name a recording is listed under: its folder name without the "capture-" prefix. */
     fun recordingName(sessionId: String): String = sessionId.removePrefix("capture-")
 
-    /** The summary line over a day's list: "100 recordings \u00b7 98 live \u00b7 2 publishing". */
+    /** The summary line over a day's list: "100 recordings" (and how many the marketplace is still looking at, when it says). */
     fun daySummary(recordings: List<UploadedRecording>): String {
-        val live = recordings.count { it.status == "live" }
-        val failed = recordings.count { it.status == "publish_failed" }
-        val publishing = recordings.size - live - failed
+        val reviewing = recordings.count { it.marketplaceStatus == "CHECKING" || it.marketplaceStatus == "IN_REVIEW" }
+        val approved = recordings.count { it.marketplaceStatus == "APPROVED" }
         return listOfNotNull(
             recordings(recordings.size),
-            "$live live".takeIf { live > 0 },
-            "$publishing publishing".takeIf { publishing > 0 },
-            "$failed failed".takeIf { failed > 0 },
+            "$reviewing in review".takeIf { reviewing > 0 },
+            "$approved approved".takeIf { approved > 0 },
         ).joinToString(" \u00b7 ")
     }
 
-    fun status(wire: String): String = when (wire) {
-        "live" -> "Live"
-        "publishing" -> "Publishing\u2026"
-        "publish_failed" -> "Publish failed"
-        else -> "Uploaded"
-    }
+    /** The marketplace backend only ever reports "uploaded"; anything else (an old cached copy) reads as uploaded too. */
+    fun status(@Suppress("UNUSED_PARAMETER") wire: String): String = "Uploaded"
 
     fun recordings(count: Int): String = if (count == 1) "1 recording" else "$count recordings"
 

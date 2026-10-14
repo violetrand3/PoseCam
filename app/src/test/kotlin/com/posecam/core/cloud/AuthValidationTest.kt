@@ -41,4 +41,27 @@ class AuthValidationTest {
     @Test fun serverErrorsAreNotShownRaw() {
         assertEquals("The server had a problem. Try again in a moment.", AuthValidation.messageFor(CloudHttpException(500, "INTERNAL", "boom")))
     }
+
+    @Test fun signingUpNeedsTheTermsAndPrivacyPolicyAccepted() {
+        assertEquals(
+            "Tick the box to accept the Terms and Privacy Policy.",
+            AuthValidation.problem("a@b.co", "longenough", "longenough", "Asha", termsAccepted = false),
+        )
+        assertNull(AuthValidation.problem("a@b.co", "longenough", "longenough", "Asha", termsAccepted = true))
+        // Signing in accepts nothing.
+        assertNull(AuthValidation.problem("a@b.co", "pw", null, termsAccepted = false))
+    }
+
+    @Test fun theApisFieldErrorsAreShownOnePerFieldInFieldOrder() {
+        val error = CloudHttpException(400, "VALIDATION", "Invalid input", null, mapOf("termsVersion" to "Terms have changed", "email" to "Already in use"))
+        assertEquals("Email: Already in use\nTerms: Terms have changed", AuthValidation.messageFor(error))
+        // A field the form does not know keeps its own name; without field errors the server's message is shown.
+        assertEquals("Phone: Too long", AuthValidation.messageFor(CloudHttpException(400, "VALIDATION", "x", null, mapOf("phone" to "Too long"))))
+        assertEquals("Invalid input", AuthValidation.messageFor(CloudHttpException(400, "VALIDATION", "invalid input")))
+    }
+
+    @Test fun campaignRefusalsReadInPlainWords() {
+        assertTrue(AuthValidation.messageFor(CloudHttpException(403, "NOT_ENROLLED", "x")).contains("accepted this campaign"))
+        assertTrue(AuthValidation.messageFor(CloudHttpException(409, "CAMPAIGN_CLOSED", "x")).contains("closed"))
+    }
 }

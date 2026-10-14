@@ -17,6 +17,7 @@ import android.os.VibratorManager
 import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
+import android.view.View
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -34,9 +35,16 @@ import com.google.ar.core.exceptions.UnavailableDeviceNotCompatibleException
 import com.google.ar.core.exceptions.UnavailableException
 import com.google.ar.core.exceptions.UnavailableSdkTooOldException
 import com.google.ar.core.exceptions.UnavailableUserDeclinedInstallationException
+import com.posecam.core.cloud.MyCampaign
+import com.posecam.core.sync.CampaignUiText
 import com.posecam.core.sync.CloudSync
 import com.posecam.core.sync.CloudUiText
-import com.posecam.core.sync.Pipe
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -49,6 +57,19 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
     private lateinit var resolutionButton: Button
     private lateinit var focusButton: Button
     private lateinit var sessionsButton: Button
+    private lateinit var campaignBar: View
+    private lateinit var campaignName: TextView
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * Why Record is off for want of a campaign (shown in the status line), or null when cloud upload is off or a campaign
+     * is chosen. Only read/written on the UI thread.
+     */
+    @Volatile private var campaignBlock: String? = null
+
+    /** The campaign the take being recorded is for (what was active when Record was pressed). */
+    private var recordingCampaign: MyCampaign? = null
+    private var askedForCampaign = false
 
     @Volatile private var session: Session? = null
     private var sessionMetadata: Map<String, Any?> = emptyMap()
@@ -101,6 +122,9 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
         focusButton = findViewById(R.id.focus)
         sessionsButton = findViewById(R.id.sessions)
         sessionsButton.setOnClickListener { startActivity(Intent(this, SessionsActivity::class.java)) }
+        campaignBar = findViewById(R.id.campaignBar)
+        campaignName = findViewById(R.id.campaignName)
+        findViewById<Button>(R.id.campaignChange).setOnClickListener { openCampaigns() }
 
         val root = getExternalFilesDir(null)
         if (root == null) {
@@ -123,7 +147,6 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
         imuSource = ImuSource(this, imuRecorder)
         // Rebuild/resume the upload queue (also adopts recordings made before cloud upload existed). No-op when off.
         runCatching { CloudSync.get(this).recoverQueue() }
-        runCatching { CloudSync.get(this).refreshPipes() }
 
         surfaceView.preserveEGLContextOnPause = true
         surfaceView.setEGLContextClientVersion(2)
@@ -148,6 +171,8 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
             startActivity(Intent(this, AuthActivity::class.java).putExtra(AuthActivity.EXTRA_REQUIRED, true))
             return
         }
+        showCampaign()
+        refreshCampaigns()
 
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             // onResume runs again while the dialog is up; a second request would cancel the first.
@@ -193,7 +218,46 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
         imuSource.pause()
     }
 
+    // ---- campaign (cloud upload only) --------------------------------------------------------------------------
+
+    private fun cloud(): CloudSync? = runCatching { CloudSync.get(this).takeIf { it.config.enabled } }.getOrNull()
+
+    private fun openCampaigns() {
+        if (recorder.isRecording) return
+        startActivity(Intent(this, MyCampaignsActivity::class.java))
+    }
+
+    /** The active campaign from the cached list (no network): its name on top, and Record off without one. */
+    private fun showCampaign() {
+        val sync = cloud()
+        if (sync == null) {
+            campaignBar.visibility = View.GONE
+            campaignBlock = null
+            return
+        }
+        val all = sync.myCampaigns()
+        val active = sync.campaigns.active(sync.recordingAccountId())
+        campaignBar.visibility = View.VISIBLE
+        campaignName.text = CampaignUiText.captureHeader(active, all.isNotEmpty())
+        campaignBlock = if (active != null) null else CampaignUiText.captureHeader(null, all.isNotEmpty())
+        // The remembered campaign is gone from the list (or there are several and none chosen): ask, once per visit.
+        if (active == null && all.isNotEmpty() && !askedForCampaign && !recorder.isRecording) {
+            askedForCampaign = true
+            openCampaigns()
+        }
+    }
+
+    /** Fetches the collector's campaigns in the background and redraws the bar if the list changed. */
+    private fun refreshCampaigns() {
+        val sync = cloud() ?: return
+        uiScope.launch {
+            val updated = runCatching { withContext(Dispatchers.IO) { sync.refreshCampaignsNow() } }.getOrDefault(false)
+            if (updated && !recorder.isRecording) showCampaign()
+        }
+    }
+
     override fun onDestroy() {
+        uiScope.cancel()
         session?.close()
         session = null
         super.onDestroy()
@@ -370,6 +434,11 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
         if (recorder.isRecording) {
             stopRecording()
         } else {
+            campaignBlock?.let { reason ->
+                // Defence behind the disabled button: a take without a campaign would never be uploaded.
+                Toast.makeText(this, reason, Toast.LENGTH_LONG).show()
+                return
+            }
             val freeGb = freeGb()
             if (freeGb < MIN_FREE_GB) {
                 // With cloud upload on, recordings already safe in the cloud can be reclaimed automatically.
@@ -391,6 +460,7 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
                 wasTrackingWhileRecording = true
                 fpsWindowStartNs = 0
                 liveFps = 30.0
+                recordingCampaign = cloud()?.let { it.campaigns.active(it.recordingAccountId()) }
                 val dir = recorder.start(sessionMetadata, deviceInfo, pressedNs)
                 imuRecorder.start(dir)
                 Log.i(TAG, "Recording started: $dir")
@@ -434,32 +504,21 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
             append(summary.directory.name)
             cloudNote(verdict.redo)?.let { append("\n\n").append(it) }
         }
-        TakeResultDialog.show(this, verdict.headline, body, verdict.redo, cloudEnabled(), availablePipes()) { pipe -> onPipeChosen(summary, pipe) }
-    }
-
-    /** The backend's pipes as last cached on this phone; the three built-in ones if none was ever fetched. */
-    private fun availablePipes(): List<Pipe> = runCatching { CloudSync.get(this).pipes.current() }.getOrDefault(Pipe.DEFAULTS)
-
-    private fun cloudEnabled(): Boolean = runCatching { CloudSync.get(this).config.enabled }.getOrDefault(false)
-
-    /** The collector chose a pipe: this take is queued for upload (earlier recordings were already uploading). */
-    private fun onPipeChosen(summary: PoseRecorder.Summary, pipe: Pipe) {
-        val message = runCatching {
-            val sync = CloudSync.get(this)
-            sync.coordinator.choosePipe(summary.directory.name, pipe)
-            val policy = sync.settings.policy
-            CloudUiText.pipeChosenMessage(pipe, policy, sync.networkStatus.satisfies(policy))
-        }.getOrNull() ?: return
-        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        TakeResultDialog.show(this, verdict.headline, body)
         // Exports are automatic and wait for the rotation: asked here once, never per take.
-        runCatching { ExportRotationDialog.askOnceIfUnset(this, CloudSync.get(this)) }
+        if (!verdict.redo) runCatching { cloud()?.let { ExportRotationDialog.askOnceIfUnset(this, it) } }
     }
 
-    /** One line for the end-of-take dialog when cloud upload is on; null (nothing added) when it is off. */
+    /**
+     * One line for the end-of-take dialog when cloud upload is on; null (nothing added) when it is off. A good take is
+     * already queued under the campaign it was recorded for -- nothing is asked -- and a redo take is never uploaded.
+     */
     private fun cloudNote(redo: Boolean): String? = runCatching {
-        if (!CloudSync.get(this).config.enabled) return@runCatching null
-        if (redo) "Not uploaded. You can still file it under a pipe later, in Recordings."
-        else "Choose a pipe to file this take under: it uploads once you do."
+        val sync = cloud() ?: return@runCatching null
+        if (redo) return@runCatching CloudUiText.notUploadedTakeMessage(redo = true, complete = true)
+        val campaign = recordingCampaign ?: return@runCatching "Not uploaded: no campaign was chosen."
+        val policy = sync.settings.policy
+        CloudUiText.uploadingToMessage(campaign.title, policy, sync.networkStatus.satisfies(policy))
     }.getOrNull()
 
     private var handlingWriteFailure = false
@@ -638,6 +697,7 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
                 seconds, frames, liveFps,
                 if (dropped > 0) "  ·  $dropped dropped" else "",
                 if (jumps > 0) "  ·  $jumps jump(s)" else "", tracking)
+            armed && campaignBlock != null -> "${campaignBlock}\nTracking: $tracking"
             armed -> "Ready to record  ·  %.0f min of space left\nTracking: %s".format(60 * freeGb() / GB_PER_HOUR, tracking)
             state == TrackingState.TRACKING -> "Stabilizing, keep moving slowly…\nTracking: $tracking"
             else -> "Move the phone slowly to start tracking…\nTracking: $tracking"
@@ -647,7 +707,7 @@ class CaptureActivity : Activity(), GLSurfaceView.Renderer {
             statusView.setBackgroundColor(
                 if (recording && state != TrackingState.TRACKING) 0xCCB00020.toInt() else 0x99000000.toInt()
             )
-            recordButton.isEnabled = recording || armed
+            recordButton.isEnabled = recording || (armed && campaignBlock == null)
             resolutionButton.isEnabled = !recording && availableSizes.size > 1
             focusButton.isEnabled = !recording
             val offProtocol = currentSize != (CameraConfigs.TARGET_WIDTH to CameraConfigs.TARGET_HEIGHT) ||

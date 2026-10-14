@@ -1,5 +1,8 @@
 package com.posecam.core.sync
 
+import com.posecam.core.cloud.CampaignProgress
+import com.posecam.core.cloud.CampaignRules
+import com.posecam.core.cloud.MyCampaign
 import java.io.File
 import java.security.MessageDigest
 import kotlin.io.path.createTempDirectory
@@ -17,12 +20,30 @@ class SyncFixture {
     val api = FakeCloudApi()
     val s3 = FakeS3Transport()
     val materializer = FrameChunkMaterializer(repo, kotlinx.coroutines.Dispatchers.Unconfined)
+    /** The account the fixture's processor uploads for (sessions of the fake DAO belong to it unless a test says otherwise). */
+    var signedInAccount: String? = ACCOUNT
     val processor = UploadProcessor(
         repo, api, s3, FileHasher(), { "install-1" }, "test", materializer, isRecording = { recording },
+        account = AccountScope({ signedInAccount }),
     )
 
-    /** A PoseCam-style session folder: `captures/<id>/manifest.json` with `"complete"`. */
-    fun sessionDir(sessionId: String = SESSION, status: String = "complete"): File {
+    /** A processor over the fixture's fakes for a different [AccountScope] (the account tests change who is signed in). */
+    fun processorFor(
+        scope: AccountScope,
+        rawPlan: (String, File) -> List<QueuedFile> = { _, _ -> emptyList() },
+        cloud: com.posecam.core.cloud.CloudApi = api,
+    ) = UploadProcessor(
+        repo, cloud, s3, FileHasher(), { "install-1" }, "test", materializer, isRecording = { recording },
+        account = scope, rawPlan = rawPlan,
+    )
+
+    fun processorFor(scope: () -> AccountScope) = processorFor(scope())
+
+    /**
+     * A PoseCam-style session folder: `captures/<id>/manifest.json` with `"complete"`. By default a GOOD take (30 s, tracked
+     * throughout, no jumps); [redo] writes one the verdict calls a redo (two pose jumps).
+     */
+    fun sessionDir(sessionId: String = SESSION, status: String = "complete", redo: Boolean = false): File {
         val complete = status == "complete"
         val dir = File(capturesRoot, sessionId).also { it.mkdirs() }
         File(dir, "manifest.json").writeText(
@@ -31,9 +52,17 @@ class SyncFixture {
   "session_id": "$sessionId",
   "start_wall_time_utc": "2026-09-17T09:00:00.000Z",
   "complete": $complete,
-  "frame_count": 3
+  "frame_count": 900,
+  "tracked_frame_count": 900,
+  "longest_tracking_gap_s": 0.0,
+  "measured_fps": 30.0,
+  "first_timestamp_ns": 1000000000,
+  "last_timestamp_ns": 31000000000,
+  "images": {"dropped": {}, "write_failures": []},
+  "pose_jumps": {"count": ${if (redo) 2 else 0}}
 }""",
         )
+        File(dir, "device.json").writeText("""{"manufacturer":"samsung","model":"SM-G781B","device":"r8q","hardware":"qcom","android_release":"13"}""")
         return dir
     }
 
@@ -63,6 +92,24 @@ class SyncFixture {
 
     companion object {
         const val SESSION = "capture-20260917T090000-a3f9c1"
+        const val ACCOUNT = "11111111-1111-4111-8111-111111111111"
+        const val OTHER_ACCOUNT = "22222222-2222-4222-8222-222222222222"
+        const val CAMPAIGN = "5f0c1a52-3c1e-4e0a-9d6f-0a1b2c3d4e5f"
+        const val CAMPAIGN_2 = "7a1d2b63-4d2f-4b1b-8e7a-1b2c3d4e5f60"
+
+        fun campaign(
+            id: String,
+            title: String,
+            collectRaw: Boolean = false,
+            status: String = MyCampaign.STATUS_ACTIVE,
+            remaining: Int = 10,
+            acceptingUploads: Boolean = true,
+        ) = MyCampaign(
+            id = id, title = title, description = "", instructions = "Record the whole task in one go.", referenceInfo = null,
+            currency = "INR", rewardPerRecording = 5000, rewardPoints = 0, rules = CampaignRules(5, 600, "ANY"),
+            collectRaw = collectRaw, target = 50, remaining = remaining, endDate = null, enrolledAt = "2026-09-01T00:00:00Z",
+            acceptingUploads = acceptingUploads, status = status, progress = CampaignProgress(12, 1, 9, 1, 1, 45000),
+        )
     }
 }
 

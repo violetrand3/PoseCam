@@ -26,12 +26,16 @@ class UploadCoordinator(
     private val scheduler: UploadScheduler,
     private val staging: UploadStaging,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    /** The signed-in (or last signed-in) account: every recording started now belongs to it. Null: unowned, adopted later. */
+    private val accountId: () -> String? = { null },
+    /** The campaign chosen for recording right now, from the phone's cached list; null: nothing is queued for this take. */
+    private val activeCampaign: () -> ActiveCampaign? = { null },
 ) : SessionFileListener {
 
     private sealed interface Event {
-        data class Started(val sessionId: String, val directory: File) : Event
+        data class Started(val sessionId: String, val directory: File, val campaign: ActiveCampaign?, val account: String?) : Event
         data class Finalized(val sessionId: String, val directory: File, val status: String) : Event
-        data class ChoosePipe(val sessionId: String, val pipe: Pipe) : Event
+        data class ChooseCampaign(val sessionId: String, val campaign: ActiveCampaign) : Event
     }
 
     private val events = Channel<Event>(Channel.UNLIMITED)
@@ -58,7 +62,11 @@ class UploadCoordinator(
         // Synchronous and cheap: queue recovery, storage cleanup and the pipeline export consult this set, and must
         // leave a session that is still being written alone.
         ActiveRecordingSessions.add(sessionId)
-        events.trySend(Event.Started(sessionId, directory))
+        // Read here, on the recording thread, so the take belongs to the campaign and account that were active when it began
+        // (not whatever has been chosen by the time the event is handled). Both are cheap reads of cached state.
+        val campaign = runCatching(activeCampaign).getOrNull()
+        val account = runCatching(accountId).getOrNull()
+        events.trySend(Event.Started(sessionId, directory, campaign, account))
     }
 
     override fun onSessionFinalized(sessionId: String, directory: File, recordingStatus: String) {
@@ -68,11 +76,12 @@ class UploadCoordinator(
     // ---- actions ---------------------------------------------------------------------------
 
     /**
-     * The collector chose where this recording goes. Sent through the same ordered channel as the recorder's events, so
-     * it can never overtake "started" / "finalized"; uploading of this session begins as soon as it is handled.
+     * The collector chose the campaign for a recording that has none (an older one) or changed it before upload. Sent
+     * through the same ordered channel as the recorder's events, so it can never overtake "started" / "finalized";
+     * uploading of this session begins as soon as it is handled. Redo takes and incomplete recordings are refused.
      */
-    fun choosePipe(sessionId: String, pipe: Pipe) {
-        events.trySend(Event.ChoosePipe(sessionId, pipe))
+    fun chooseCampaign(sessionId: String, campaign: ActiveCampaign) {
+        events.trySend(Event.ChooseCampaign(sessionId, campaign))
     }
 
     fun requestSync() {
@@ -82,7 +91,7 @@ class UploadCoordinator(
     /** The user tapped upload on one session: upload just that session now, whatever the policy. */
     fun syncSession(sessionId: String, retryFailedFiles: Boolean = false) {
         scope.launch {
-            if (retryFailedFiles) repository.retryFailed(sessionId)
+            if (retryFailedFiles) repository.retryFailed(sessionId, accountId())
             // Also first in line, so a whole-queue run that happens to be going picks it up next.
             repository.prioritizeSession(sessionId)
             scheduler.syncNow(sessionId)
@@ -91,7 +100,7 @@ class UploadCoordinator(
 
     fun retryFailed(sessionId: String?) {
         scope.launch {
-            repository.retryFailed(sessionId)
+            repository.retryFailed(sessionId, accountId())
             scheduler.syncNow(sessionId)
         }
     }
@@ -118,11 +127,21 @@ class UploadCoordinator(
 
     private suspend fun handle(event: Event) {
         when (event) {
-            is Event.Started -> repository.registerSession(event.sessionId, event.directory)
+            is Event.Started -> repository.registerSession(
+                event.sessionId, event.directory, event.campaign?.id, event.campaign?.collectRaw ?: true, event.account,
+            )
             is Event.Finalized -> {
                 val failure = runCatching {
-                    val files = UploadPlan.forSession(event.sessionId, event.directory, staging)
-                    repository.finalizeSession(event.sessionId, event.directory, event.status, files)
+                    val eligible = SessionManifestInfo.read(event.directory)?.eligibleForUpload == true &&
+                        event.status == CloudFileRules.STATUS_COMPLETE
+                    // Only a good, complete take with a campaign is queued; a redo take or an incomplete recording never is.
+                    val session = repository.session(event.sessionId)
+                    val files = if (eligible && session?.pipe != null) {
+                        UploadPlan.forSession(event.sessionId, event.directory, staging, includeRaw = session.rawRequired)
+                    } else {
+                        emptyList()
+                    }
+                    repository.finalizeSession(event.sessionId, event.directory, event.status, files, eligible)
                 }.exceptionOrNull()
                 // Cleared only after the final rows are queued, so recovery never races a half-enqueued
                 // session -- but cleared even if queueing failed, or uploads would stay blocked until the app
@@ -132,8 +151,19 @@ class UploadCoordinator(
                 if (failure != null) CloudLog.e("finalize_failed", failure, "session" to event.sessionId)
                 scheduler.schedule()
             }
-            is Event.ChoosePipe -> {
-                if (repository.setPipe(event.sessionId, event.pipe)) scheduler.schedule()
+            is Event.ChooseCampaign -> {
+                val session = repository.session(event.sessionId) ?: return
+                val directory = File(session.directoryPath)
+                val manifest = SessionManifestInfo.read(directory)
+                if (!session.recordingFinal || manifest?.eligibleForUpload != true) {
+                    CloudLog.w("campaign_refused", "session" to event.sessionId, "reason" to (manifest?.notUploadedReason ?: "not final"))
+                    return
+                }
+                if (repository.assignCampaign(event.sessionId, event.campaign.id, event.campaign.collectRaw, accountId())) {
+                    val files = UploadPlan.forSession(event.sessionId, directory, staging, includeRaw = event.campaign.collectRaw)
+                    repository.addFiles(event.sessionId, directory, files)
+                    scheduler.schedule()
+                }
             }
         }
     }

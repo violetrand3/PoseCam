@@ -54,7 +54,7 @@
             android:layout_width="wrap_content"
             android:layout_height="40dp"
             android:minWidth="0dp"
-            android:text="Sign out"
+            android:text="Log out"
             android:textAllCaps="false"
             android:textColor="#616161"
             android:textSize="14sp" />
@@ -129,10 +129,30 @@
         android:textSize="12sp"
         android:visibility="gone" />
 
+    <!-- Campaigns are chosen here; progress, review results and earnings live on the website. -->
+    <Button
+        android:id="@+id/statsCampaigns"
+        style="?android:attr/buttonBarButtonStyle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="@string/my_campaigns"
+        android:textAllCaps="false"
+        android:textColor="#00796B" />
+
+    <Button
+        android:id="@+id/statsWeb"
+        style="?android:attr/buttonBarButtonStyle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="See progress and earnings on the web"
+        android:textAllCaps="false"
+        android:textColor="#00796B" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
+        android:layout_marginTop="8dp"
         android:gravity="center_vertical"
         android:orientation="horizontal">
 
@@ -174,5 +194,17 @@
         android:text="Nothing uploaded yet."
         android:textSize="14sp"
         android:visibility="gone" />
+
+    <Button
+        android:id="@+id/statsDelete"
+        style="?android:attr/borderlessButtonStyle"
+        android:layout_width="wrap_content"
+        android:layout_height="36dp"
+        android:layout_gravity="center_horizontal"
+        android:minWidth="0dp"
+        android:text="Delete account"
+        android:textAllCaps="false"
+        android:textColor="#B3261E"
+        android:textSize="13sp" />
 
 </LinearLayout>

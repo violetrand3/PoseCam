@@ -11,7 +11,8 @@ import com.posecam.core.cloud.CreateSessionResponse
 import com.posecam.core.cloud.MultipartPartInfo
 import com.posecam.core.cloud.MultipartStart
 import com.posecam.core.cloud.PartUrlRequest
-import com.posecam.core.cloud.PipeInfo
+import com.posecam.core.cloud.MarketplaceInfo
+import com.posecam.core.cloud.MyCampaign
 import com.posecam.core.cloud.PresignedPart
 import com.posecam.core.cloud.PresignedUpload
 import com.posecam.core.cloud.SessionFileRef
@@ -53,9 +54,9 @@ class FakeUploadDao : UploadDao {
     override suspend fun uploadsForSession(sessionId: String) =
         uploads.values.filter { it.sessionId == sessionId }.sortedBy { it.relativePath }
 
-    override suspend fun runnableUploads(): List<UploadEntity> = uploads.values
+    override suspend fun runnableUploads(accountId: String): List<UploadEntity> = uploads.values
         .filter { u ->
-            u.state.isRunnable && sessions[u.sessionId]?.let { it.cloudCreated && !it.permanentFailure } == true
+            u.state.isRunnable && sessions[u.sessionId]?.let { it.cloudCreated && !it.permanentFailure && it.accountId == accountId } == true
         }
         .sortedWith(compareBy({ it.createdAt }, { it.id }))
 
@@ -91,7 +92,7 @@ class FakeUploadDao : UploadDao {
 
     override fun observeExportAggregates(): Flow<List<SessionExportAggregate>> = changes.map { exportAggregates() }
 
-    fun exportAggregates(): List<SessionExportAggregate> = uploads.values.filter { !it.required }.groupBy { it.sessionId }.map { (id, rows) ->
+    fun exportAggregates(): List<SessionExportAggregate> = uploads.values.filter { it.kind == UploadSourceKind.EXPORT }.groupBy { it.sessionId }.map { (id, rows) ->
         SessionExportAggregate(id, rows.size, rows.count { it.state == UploadState.VERIFIED }, rows.count { it.state == UploadState.FAILED })
     }
 
@@ -110,10 +111,17 @@ class FakeUploadDao : UploadDao {
     }
 
     /**
-     * Test convenience: new sessions get this pipe unless a test sets it to null. Production sessions start with no
-     * pipe (the collector chooses it); the pipe tests set this to null to exercise exactly that.
+     * Test convenience: new sessions get this campaign unless a test sets it to null. Production sessions start with the
+     * campaign that was active when the take began (none when there was none); the campaign tests set this to null to
+     * exercise exactly that.
      */
-    var defaultPipe: String? = "white"
+    var defaultPipe: String? = SyncFixture.CAMPAIGN
+
+    /**
+     * Test convenience, like [defaultPipe]: new sessions belong to this account unless a test sets it to null (a row from
+     * before accounts were tracked) or stamps its own.
+     */
+    var defaultAccountId: String? = SyncFixture.ACCOUNT
 
     /**
      * Test convenience, like [defaultPipe]: new sessions start with this export state. Production sessions start PENDING
@@ -126,6 +134,7 @@ class FakeUploadDao : UploadDao {
         if (session.sessionId in sessions) return -1
         sessions[session.sessionId] = session.copy(
             pipe = session.pipe ?: defaultPipe,
+            accountId = session.accountId ?: defaultAccountId,
             exportState = if (session.exportState == ExportState.PENDING) defaultExportState else session.exportState,
         )
         changed()
@@ -136,16 +145,25 @@ class FakeUploadDao : UploadDao {
     override suspend fun getSession(sessionId: String) = sessions[sessionId]
     override suspend fun allSessions() = sessions.values.toList()
     override fun observeSessions(): Flow<List<CloudSessionEntity>> = changes.map { sessions.values.toList() }
-    override suspend fun sessionsNeedingCreation() =
-        sessions.values.filter { !it.cloudCreated && !it.permanentFailure && it.pipe != null }
+    override suspend fun sessionsNeedingCreation(accountId: String) =
+        sessions.values.filter { !it.cloudCreated && !it.permanentFailure && it.recordingFinal && it.pipe != null && it.accountId == accountId }
 
-    override suspend fun sessionsNeedingExport() = sessions.values.filter {
-        it.exportState == ExportState.PENDING && it.recordingFinal && !it.permanentFailure && it.pipe != null
+    override suspend fun adoptUnowned(accountId: String): Int {
+        val rows = sessions.values.filter { it.accountId == null }
+        rows.forEach { sessions[it.sessionId] = it.copy(accountId = accountId) }
+        changed()
+        return rows.size
     }
 
-    override suspend fun sessionsReadyToComplete() = sessions.values.filter { s ->
+    override suspend fun sessionsNeedingExport(accountId: String?) = sessions.values.filter {
+        it.exportState == ExportState.PENDING && it.recordingFinal && !it.permanentFailure && it.pipe != null &&
+            (accountId == null || it.accountId == accountId)
+    }
+
+    override suspend fun sessionsReadyToComplete(accountId: String) = sessions.values.filter { s ->
         val required = uploads.values.filter { it.sessionId == s.sessionId && it.required }
         s.recordingFinal && s.cloudCreated && !s.permanentFailure && s.syncedAt == null &&
+            s.accountId == accountId && s.exportState == ExportState.DONE &&
             required.isNotEmpty() && required.all { it.state == UploadState.VERIFIED }
     }
 
@@ -166,7 +184,12 @@ class FakeCloudApi : CloudApi {
     val completedStatuses = mutableListOf<String>()
     val createdStatuses = mutableMapOf<String, String>()
     val createdAt = mutableMapOf<String, String>()
-    val createdPipes = mutableMapOf<String, String?>()
+    val createdCampaigns = mutableMapOf<String, String?>()
+    val createdRequests = mutableListOf<CreateSessionRequest>()
+    /** `requirements.rawRequired` of the createSession answer; null models a backend that does not say. */
+    var rawRequiredOnServer: Boolean? = null
+    /** `session.marketplace` of the complete answer. */
+    var marketplaceOnComplete: MarketplaceInfo? = MarketplaceInfo("CHECKING", null, null)
     val verified = mutableListOf<String>()
     var multipartCompletedParts: List<CompletedPart>? = null
     val partUrlRequests = mutableListOf<Int>()
@@ -191,21 +214,22 @@ class FakeCloudApi : CloudApi {
 
     fun callsTo(method: String) = calls.count { it == method || it.startsWith("$method:") }
 
-    /** What GET /v1/pipes returns; tests change it to model the backend gaining or losing a pipe. */
-    var pipesOnServer: List<PipeInfo> = listOf(PipeInfo("white", "White pipes", "#f8fafc", 1))
+    /** What GET /v1/me/campaigns returns; tests change it to model the collector accepting or losing a campaign. */
+    var campaignsOnServer: List<MyCampaign> = listOf(SyncFixture.campaign(SyncFixture.CAMPAIGN, "Kitchen tidy"))
 
-    override suspend fun listPipes(): List<PipeInfo> {
-        record("listPipes")
-        return pipesOnServer
+    override suspend fun listCampaigns(): List<MyCampaign> {
+        record("listCampaigns")
+        return campaignsOnServer
     }
 
     override suspend fun createSession(request: CreateSessionRequest): CreateSessionResponse {
         record("createSession", request.sessionId)
         createdStatuses[request.sessionId] = request.recordingStatus
-        createdPipes[request.sessionId] = request.pipe
+        createdCampaigns[request.sessionId] = request.campaignId
+        createdRequests += request
         createdAt[request.sessionId] = request.createdAt
         val created = createdSessions.add(request.sessionId)
-        return CreateSessionResponse(view(request.sessionId), created, null)
+        return CreateSessionResponse(view(request.sessionId), created, null, rawRequiredOnServer)
     }
 
     override suspend fun requestUpload(sessionId: String, request: UploadRequest): PresignedUpload {
@@ -262,7 +286,7 @@ class FakeCloudApi : CloudApi {
         record("completeSession", sessionId)
         completedSessions += files
         completedStatuses += recordingStatus
-        return view(sessionId)
+        return view(sessionId).copy(marketplace = marketplaceOnComplete)
     }
 
     private fun view(id: String) = CloudSessionView(id, "device", null, null, "CREATED", 0, 0, 0, 0, null)

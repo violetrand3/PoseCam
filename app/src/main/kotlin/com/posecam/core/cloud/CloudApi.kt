@@ -6,8 +6,8 @@ package com.posecam.core.cloud
  * throws [CloudException]; callers treat [CloudException.retryable] as "try again later".
  */
 interface CloudApi {
-    /** The pipes (categories) the backend accepts, in the order they should be offered. */
-    suspend fun listPipes(): List<PipeInfo>
+    /** The campaigns the collector accepted on the website and can still record for (`GET /v1/me/campaigns`), newest first. */
+    suspend fun listCampaigns(): List<MyCampaign>
 
     /** Idempotent: repeating it for the same session returns the existing record. */
     suspend fun createSession(request: CreateSessionRequest): CreateSessionResponse
@@ -37,7 +37,7 @@ interface CloudApi {
     /** The backend's current record of a session, including whether it has reached the website. */
     suspend fun getSession(sessionId: String): CloudSessionView
 
-    /** Puts a synced recording the backend failed to publish (or never got to) back in its publish queue. */
+    /** Legacy (LabelNow) publishing: the marketplace backend has no such call and never reports a publish status. */
     suspend fun retryPublish(sessionId: String): CloudSessionView
 
     suspend fun completeSession(

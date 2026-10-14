@@ -26,7 +26,7 @@ class UploadProcessorChunkTest {
         val dir = f.sessionDir(id)
         listOf("poses.csv", "intrinsics.json").forEach { f.file(dir, it, "data-$it") }
         f.frames(dir, frameCount)
-        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging))
+        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging, includeRaw = true))
         if (created) f.repo.markSessionCreated(id)
         return dir
     }
@@ -222,7 +222,7 @@ class UploadProcessorChunkTest {
     @Test
     fun incompleteTakesAreReportedToTheBackendAsIncomplete() = runBlocking {
         val dir = f.sessionDir(id, status = "incomplete")
-        f.repo.finalizeSession(id, dir, "incomplete", UploadPlan.forSession(id, dir, f.staging))
+        f.repo.finalizeSession(id, dir, "incomplete", UploadPlan.forSession(id, dir, f.staging, includeRaw = true))
         f.repo.markSessionCreated(id)
 
         f.processor.runQueue()
@@ -233,7 +233,7 @@ class UploadProcessorChunkTest {
     @Test
     fun theCloudSessionIsCreatedWithTheManifestStartTimeAndStatus() = runBlocking {
         val dir = f.sessionDir(id)
-        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging))
+        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging, includeRaw = true))
 
         f.processor.runQueue()
 

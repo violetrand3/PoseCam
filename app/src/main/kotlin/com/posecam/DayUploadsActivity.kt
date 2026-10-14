@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.BaseAdapter
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -17,7 +18,6 @@ import com.posecam.core.cloud.UploadStatsCache
 import com.posecam.core.cloud.UploadStatsText
 import com.posecam.core.cloud.UploadedRecording
 import com.posecam.core.sync.CloudSync
-import com.posecam.core.sync.Pipe
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,8 +26,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * One day of "My uploads": every recording uploaded that day with its pipe and status. A day can hold a hundred, so the
- * pipe chips (and "Not live") narrow the list, and the summary line over it always describes the whole day.
+ * One day of "My uploads": every recording uploaded that day with its campaign and status ("Uploaded", and under it the
+ * marketplace's view -- "In review", "Approved", ... -- when the backend says). A day can hold a hundred, so the campaign
+ * chips narrow the list, and the summary line over it always describes the whole day.
  */
 class DayUploadsActivity : Activity() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -43,12 +44,11 @@ class DayUploadsActivity : Activity() {
     private lateinit var date: String
     private var recordings: List<UploadedRecording> = emptyList()
     private var filter: Filter = Filter.All
-    private var pipeName: (String) -> String? = { null }
+    private var campaignName: (String) -> String? = { null }
 
     private sealed interface Filter {
         data object All : Filter
-        data object NotLive : Filter
-        data class Pipe(val wire: String) : Filter
+        data class Campaign(val id: String) : Filter
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,8 +65,9 @@ class DayUploadsActivity : Activity() {
         empty = findViewById(R.id.dayEmpty)
         date = intent.getStringExtra(EXTRA_DATE) ?: run { finish(); return }
         title = UploadStatsText.dayLabel(date, UploadStatsText.today())
-        val catalog = runCatching { sync.pipes.current() }.getOrDefault(emptyList())
-        pipeName = { wire -> com.posecam.core.sync.Pipe.fromWire(wire, catalog)?.label }
+        val account = sync.recordingAccountId()
+        campaignName = { id -> sync.campaigns.title(account, id) }
+        findViewById<Button>(R.id.dayWeb).setOnClickListener { openWebLink(sync.meta.current().webAppUrl) }
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean = handleBackArrow(item) || super.onOptionsItemSelected(item)
@@ -111,7 +112,7 @@ class DayUploadsActivity : Activity() {
         recordings = all
         showNote(footnote)
         summary.text = if (all.isEmpty()) "Nothing uploaded this day" else UploadStatsText.daySummary(all)
-        if (filter is Filter.Pipe && all.none { it.pipe == (filter as Filter.Pipe).wire }) filter = Filter.All
+        if (filter is Filter.Campaign && all.none { it.campaignId == (filter as Filter.Campaign).id }) filter = Filter.All
         renderChips()
         renderList()
     }
@@ -120,11 +121,10 @@ class DayUploadsActivity : Activity() {
         chips.removeAllViews()
         (chips.parent as View).visibility = if (recordings.size < 2) View.GONE else View.VISIBLE
         chip("All ${recordings.size}", Filter.All)
-        val notLive = recordings.count { it.status != "live" }
-        if (notLive > 0) chip("Not live $notLive", Filter.NotLive)
-        recordings.groupingBy { it.pipe }.eachCount().entries
+        val titles = recordings.associate { it.campaignId to it.campaignTitle }
+        recordings.groupingBy { it.campaignId }.eachCount().entries
             .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
-            .forEach { (wire, count) -> chip("${UploadStatsText.shortPipe(pipeName(wire) ?: wire)} $count", Filter.Pipe(wire)) }
+            .forEach { (id, count) -> chip("${campaignName(id) ?: titles[id]?.ifBlank { null } ?: id} $count", Filter.Campaign(id)) }
     }
 
     private fun chip(label: String, target: Filter) {
@@ -154,8 +154,7 @@ class DayUploadsActivity : Activity() {
     private fun renderList() {
         val shown = when (val f = filter) {
             Filter.All -> recordings
-            Filter.NotLive -> recordings.filter { it.status != "live" }
-            is Filter.Pipe -> recordings.filter { it.pipe == f.wire }
+            is Filter.Campaign -> recordings.filter { it.campaignId == f.id }
         }
         list.adapter = RecordingAdapter(shown)
         list.visibility = if (shown.isEmpty()) View.GONE else View.VISIBLE
@@ -174,14 +173,16 @@ class DayUploadsActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 setPadding(0, (6 * density).toInt(), 0, (6 * density).toInt())
                 addView(TextView(context).apply { textSize = 15f; maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END; tag = "name" })
-                addView(TextView(context).apply { textSize = 12f; tag = "detail" })
+                addView(TextView(context).apply { textSize = 12f; alpha = 0.65f; tag = "detail" })
+                addView(TextView(context).apply { textSize = 12f; setTextColor(0xFF00796B.toInt()); tag = "review" })
             }
             val item = items[position]
             root.findViewWithTag<TextView>("name").text = UploadStatsText.recordingName(item.sessionId)
-            root.findViewWithTag<TextView>("detail").apply {
-                text = UploadStatsText.recordingDetail(item, pipeName)
-                alpha = if (item.status == "publish_failed") 1f else 0.65f
-                setTextColor(if (item.status == "publish_failed") 0xFFC62828.toInt() else 0xFF000000.toInt())
+            root.findViewWithTag<TextView>("detail").text = UploadStatsText.recordingDetail(item, campaignName)
+            root.findViewWithTag<TextView>("review").apply {
+                val line = UploadStatsText.reviewLine(item)
+                text = line
+                visibility = if (line == null) View.GONE else View.VISIBLE
             }
             return root
         }

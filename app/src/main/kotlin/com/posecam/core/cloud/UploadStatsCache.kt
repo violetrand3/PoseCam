@@ -52,8 +52,7 @@ class UploadStatsCache(context: Context) {
                     stats.days.forEach {
                         array.put(
                             JSONObject().put("date", it.date).put("recordings", it.recordings)
-                                .put("pipes", JSONObject(it.pipes)).put("live", it.live)
-                                .put("publishing", it.publishing).put("failed", it.failed),
+                                .put("campaigns", JSONObject(it.campaigns)),
                         )
                     }
                 },
@@ -80,8 +79,9 @@ class UploadStatsCache(context: Context) {
         fun encodeRecordings(recordings: List<UploadedRecording>): String = JSONArray().also { array ->
             recordings.forEach {
                 array.put(
-                    JSONObject().put("sessionId", it.sessionId).put("pipe", it.pipe).put("pipeLabel", it.pipeLabel)
-                        .put("uploadedAt", it.uploadedAt).put("date", it.date).put("status", it.status),
+                    JSONObject().put("sessionId", it.sessionId).put("campaignId", it.campaignId)
+                        .put("campaignTitle", it.campaignTitle).put("uploadedAt", it.uploadedAt).put("date", it.date)
+                        .put("status", it.status).put("marketplaceStatus", it.marketplaceStatus ?: JSONObject.NULL),
                 )
             }
         }.toString()

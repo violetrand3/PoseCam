@@ -23,7 +23,10 @@ class CloudFileRulesTest {
             val entry = allowed.getJSONObject(i)
             val path = entry.getString("path")
             assertEquals(path, UploadFileType.valueOf(entry.getString("type")), CloudFileRules.classify(path))
-            assertEquals(path, entry.getBoolean("required"), CloudFileRules.isRequired(path))
+            // The shared file's "required" is the legacy flag: what holds up SYNCED when the raw data is collected and the
+            // export was optional. Exports now always hold it up; the raw files only for a campaign that collects them.
+            val type = UploadFileType.valueOf(entry.getString("type"))
+            assertEquals(path, type == UploadFileType.EXPORT || entry.getBoolean("required"), CloudFileRules.isRequired(path, rawRequired = true))
             assertTrue(path, CloudFileRules.isUploadable(path))
         }
     }
@@ -33,7 +36,8 @@ class CloudFileRulesTest {
         for (i in 0 until rejected.length()) {
             val path = rejected.getString(i)
             assertNull(path, CloudFileRules.classify(path))
-            assertFalse(path, CloudFileRules.isRequired(path))
+            assertFalse(path, CloudFileRules.isRequired(path, rawRequired = true))
+            assertFalse(path, CloudFileRules.isRequired(path, rawRequired = false))
         }
     }
 
@@ -54,12 +58,31 @@ class CloudFileRulesTest {
         }
     }
 
-    @Test fun exportsAreOptionalAndNeverHoldUpSync() {
+    @Test fun exportsAreRequiredForSyncWhateverTheCampaignCollects() {
         val export = "export/2026-09-16-14_30_52-a3f9c1-s1/posecam_export.json"
         assertEquals(UploadFileType.EXPORT, CloudFileRules.classify(export))
-        assertFalse(CloudFileRules.isRequired(export))
-        assertTrue(CloudFileRules.isRequired("poses.csv"))
-        assertTrue(CloudFileRules.isRequired("frames-00000.zip"))
+        assertTrue(CloudFileRules.isRequired(export, rawRequired = false))
+        assertTrue(CloudFileRules.isRequired(export, rawRequired = true))
+    }
+
+    @Test fun manifestAndDeviceAreAlwaysRequired() {
+        for (raw in listOf(true, false)) {
+            assertTrue(CloudFileRules.isRequired("manifest.json", raw))
+            assertTrue(CloudFileRules.isRequired("device.json", raw))
+        }
+    }
+
+    @Test fun rawDataIsRequiredOnlyWhenTheCampaignCollectsIt() {
+        val raw = listOf("intrinsics.json", "poses.csv", "frame_metadata.csv", "imu.csv", "frames-00000.zip", "frames-00042.zip")
+        for (path in raw) {
+            assertTrue(path, CloudFileRules.isRequired(path, rawRequired = true))
+            assertFalse(path, CloudFileRules.isRequired(path, rawRequired = false))
+            assertTrue(path, CloudFileRules.isRaw(path))
+            assertTrue(path, CloudFileRules.isUploadable(path)) // the allow-list itself does not depend on the campaign
+        }
+        assertFalse(CloudFileRules.isRaw("manifest.json"))
+        assertFalse(CloudFileRules.isRaw("export/2026-09-16-14_30_52-a3f9c1-s1/posecam_export.json"))
+        assertFalse(CloudFileRules.isRaw("notes.txt"))
     }
 
     @Test fun listPlainUploadableSkipsChunksJpegsAndStrayFiles() {

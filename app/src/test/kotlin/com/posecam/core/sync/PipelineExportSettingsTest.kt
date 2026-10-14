@@ -119,19 +119,21 @@ class PipelineExportSettingsTest {
         old.close()
 
         val db = Room.databaseBuilder(context, UploadDatabase::class.java, name)
-            .addMigrations(UploadDatabase.MIGRATION_1_2, UploadDatabase.MIGRATION_2_3).allowMainThreadQueries().build()
+            .addMigrations(UploadDatabase.MIGRATION_1_2, UploadDatabase.MIGRATION_2_3, UploadDatabase.MIGRATION_3_4).allowMainThreadQueries().build()
         try {
             val session = db.uploadDao().getSession("capture-20260917T090000-a3f9c1")!!
             assertEquals("black", session.pipe) // nothing that was there is lost
             assertEquals(5000L, session.syncedAt)
             assertEquals(ExportState.PENDING, session.exportState) // so its export is made and uploaded
             assertNull(session.exportNote)
-            // So the first check after the update learns whether the website already has it.
-            assertEquals(PublishState.PENDING, session.publishState)
+            // The marketplace backend never reports publishing, so nothing waits for it.
+            assertEquals(PublishState.UNSUPPORTED, session.publishState)
+            assertNull(session.accountId) // adopted by the first account that signs in
+            assertTrue(session.rawRequired) // it uploaded everything, as before
             assertEquals(0, session.publishedSets)
             assertNull(session.publishNote)
             assertEquals(1, db.uploadDao().uploadsForSession(session.sessionId).size)
-            assertEquals(listOf(session.sessionId), db.uploadDao().sessionsNeedingExport().map { it.sessionId })
+            assertEquals(listOf(session.sessionId), db.uploadDao().sessionsNeedingExport(null).map { it.sessionId })
         } finally {
             db.close()
             context.deleteDatabase(name)

@@ -46,12 +46,15 @@ class PipelineExportStage(
     private val isRecording: () -> Boolean = { ActiveRecordingSessions.snapshot().isNotEmpty() },
 ) {
     /** Whether a run could export anything now; keeps the worker from starting for nothing. */
-    suspend fun hasWork(): Boolean = rotation() != null && repository.sessionsNeedingExport().isNotEmpty()
+    suspend fun hasWork(accountId: String? = null): Boolean = rotation() != null && repository.sessionsNeedingExport(accountId).isNotEmpty()
 
-    /** Exports every pending recording ([onlySessionId]: just that one). Stops quietly when a take starts. */
-    suspend fun runPending(onlySessionId: String? = null) {
+    /**
+     * Exports every pending recording ([onlySessionId]: just that one; [accountId]: just that account's, null for all --
+     * the export is local work and sends nothing). Stops quietly when a take starts.
+     */
+    suspend fun runPending(onlySessionId: String? = null, accountId: String? = null) {
         val degrees = rotation() ?: return
-        for (session in repository.sessionsNeedingExport().filter { onlySessionId == null || it.sessionId == onlySessionId }) {
+        for (session in repository.sessionsNeedingExport(accountId).filter { onlySessionId == null || it.sessionId == onlySessionId }) {
             if (isRecording()) return
             if (!exportOne(session, degrees)) return
         }

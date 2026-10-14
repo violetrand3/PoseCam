@@ -228,7 +228,7 @@ class SessionsActivity : Activity() {
             }
             val skipped = if (done.skipped > 0) "\n${done.skipped} short stretch(es) skipped." else ""
             val next = if (offersFileSharing) "Send the export to whoever processes the data."
-            else "This was a local check: recordings are exported and uploaded automatically once they are filed under a pipe."
+            else "This was a local check: recordings are exported and uploaded automatically once they are queued for a campaign."
             AlertDialog.Builder(this)
                 .setTitle("Exported ${done.folders.size} recording(s)")
                 .setMessage("${done.frames} frames, %.0f MB, rotation $rotation°.$skipped\n\n$next".format(done.bytes / 1e6))

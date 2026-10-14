@@ -15,9 +15,13 @@ class UploadQueueRecoveryTest {
 
     private fun recovery() = UploadQueueRecovery(f.capturesRoot, f.repo, scheduler, f.staging) { it in active }
 
-    /** A finished PoseCam recording: 8 plain files + 3 frame chunks (2,300 frames). */
-    private fun session(id: String = "capture-20260917T090000-a3f9c1", complete: Boolean = true): File {
+    /**
+     * A finished PoseCam recording: 8 plain files + 3 frame chunks (2,300 frames). [campaign]: it was recorded for the
+     * campaign `CAMPAIGN` (which collects raw data) by the signed-in account; without it, it is an older recording.
+     */
+    private fun session(id: String = "capture-20260917T090000-a3f9c1", complete: Boolean = true, campaign: Boolean = true): File {
         val dir = f.sessionDir(id, status = if (complete) "complete" else "incomplete")
+        if (campaign) kotlinx.coroutines.runBlocking { f.repo.registerSession(id, dir, SyncFixture.CAMPAIGN, rawRequired = true, accountId = SyncFixture.ACCOUNT) }
         listOf("poses.csv", "frame_metadata.csv", "imu.csv", "intrinsics.json", "device.json").forEach { f.file(dir, it, "x-$it") }
         // Not part of the cloud file set: must never be queued.
         f.file(dir, "scratch.tmp", "junk")
@@ -57,19 +61,44 @@ class UploadQueueRecoveryTest {
     }
 
     @Test
-    fun aKilledTakeIsAdoptedAsIncompleteEvidence() = runBlocking {
+    fun aKilledTakeIsAdoptedAsIncompleteAndNeverQueued() = runBlocking {
         val id = "capture-20260917T090000-a3f9c1"
         session(id, complete = false)
 
         recovery().run()
 
         assertEquals("incomplete", f.repo.session(id)!!.recordingStatus)
-        assertEquals(full, f.repo.uploadsForSession(id).size)
+        assertTrue(f.repo.uploadsForSession(id).isEmpty()) // the marketplace never accepts an incomplete recording
+        assertNull(f.repo.session(id)!!.pipe) // and the campaign it started with is dropped
+    }
+
+    @Test
+    fun anOlderRecordingWithNoCampaignIsAdoptedButNothingIsQueuedForIt() = runBlocking {
+        val id = "capture-20260917T090000-a3f9c1"
+        session(id, campaign = false)
+
+        val report = recovery().run()
+
+        assertTrue(f.repo.session(id)!!.recordingFinal)
+        assertTrue(f.repo.uploadsForSession(id).isEmpty())
+        assertEquals(0, report.filesQueued)
+    }
+
+    @Test
+    fun aCampaignThatDoesNotCollectRawQueuesOnlyManifestAndDevice() = runBlocking {
+        val id = "capture-20260917T090000-a3f9c1"
+        val dir = session(id)
+        f.dao.updateSession(f.repo.session(id)!!.copy(rawRequired = false))
+
+        recovery().run()
+
+        assertEquals(listOf("device.json", "manifest.json"), f.repo.uploadsForSession(id).map { it.relativePath })
+        assertTrue(dir.resolve("frames").isDirectory) // the frames are untouched, just not queued
     }
 
     @Test
     fun neverQueuesFilesOfASessionThatIsStillBeingWritten() = runBlocking {
-        session("capture-20260917T090000-a3f9c1")
+        session("capture-20260917T090000-a3f9c1", campaign = false)
         active = setOf("capture-20260917T090000-a3f9c1") // a writer is open in this process
 
         val report = recovery().run()
@@ -81,8 +110,8 @@ class UploadQueueRecoveryTest {
     @Test
     fun skipsFoldersTheBackendWouldRefuseForever() = runBlocking {
         session("capture-20260917T090000-a3f9c1")
-        session("my-notes")                       // not a PoseCam id
-        session("capture-20260917T090001-A3F9C1") // uppercase suffix: the backend regex is lowercase hex
+        session("my-notes", campaign = false)                       // not a PoseCam id
+        session("capture-20260917T090001-A3F9C1", campaign = false) // uppercase suffix: the backend regex is lowercase hex
         File(f.capturesRoot, "empty-folder").mkdirs() // no manifest at all
 
         recovery().run()
@@ -93,11 +122,12 @@ class UploadQueueRecoveryTest {
     @Test
     fun aRecordingWithoutFramesStillSyncsItsPlainFiles() = runBlocking {
         val id = "capture-20260917T090000-a3f9c1"
-        f.sessionDir(id)
+        val dir = f.sessionDir(id)
+        f.repo.registerSession(id, dir, SyncFixture.CAMPAIGN, rawRequired = true, accountId = SyncFixture.ACCOUNT)
 
         recovery().run()
 
-        assertEquals(listOf("manifest.json"), f.repo.uploadsForSession(id).map { it.relativePath })
+        assertEquals(listOf("device.json", "manifest.json"), f.repo.uploadsForSession(id).map { it.relativePath })
     }
 
     @Test

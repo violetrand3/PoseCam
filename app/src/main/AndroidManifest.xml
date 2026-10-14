@@ -53,6 +53,12 @@
             android:windowSoftInputMode="adjustResize" />
 
         <activity
+            android:name=".MyCampaignsActivity"
+            android:exported="false"
+            android:label="My campaigns"
+            android:theme="@android:style/Theme.Material.Light" />
+
+        <activity
             android:name=".UploadStatsActivity"
             android:exported="false"
             android:label="My uploads"

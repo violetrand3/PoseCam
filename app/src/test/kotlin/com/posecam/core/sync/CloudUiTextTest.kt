@@ -17,8 +17,70 @@ class CloudUiTextTest {
         assertEquals("On this phone only", row(summary(SessionCloudStatus.LOCAL_ONLY)))
         assertEquals("Queued", row(summary(SessionCloudStatus.PENDING)))
         assertEquals("Verifying", row(summary(SessionCloudStatus.VERIFYING)))
-        assertEquals("Uploaded · publishing…", row(summary(SessionCloudStatus.SYNCED)))
+        assertEquals("Synced", row(summary(SessionCloudStatus.SYNCED).copy(publishState = PublishState.UNSUPPORTED)))
         assertEquals("Upload failed", row(summary(SessionCloudStatus.FAILED)))
+        assertEquals("Choose a campaign to upload", row(summary(SessionCloudStatus.AWAITING_CAMPAIGN)))
+        assertEquals("Belongs to another account", row(summary(SessionCloudStatus.OTHER_ACCOUNT)))
+    }
+
+    // ---- the video export holds up SYNCED: the row says why a recording is not uploaded -----------
+
+    private fun blocked(state: ExportState, rotationSet: Boolean = true) = CloudUiText.rowStatus(
+        summary(SessionCloudStatus.EXPORT_BLOCKED).copy(exportState = state), SyncPolicy.WIFI_ONLY, false, rotationSet,
+    )
+
+    @Test fun aRecordingWhoseExportCannotBeMadeNeverClaimsToBeSyncedAndSaysWhy() {
+        assertEquals("Not uploaded: off protocol (wrong size, frame rate or focus)", blocked(ExportState.OFF_PROTOCOL))
+        assertEquals("Not uploaded: it cannot be exported", blocked(ExportState.NOT_EXPORTABLE))
+        assertEquals("Not uploaded: export failed", blocked(ExportState.FAILED))
+        assertEquals("Preparing the video…", blocked(ExportState.PENDING))
+        assertEquals("Set the video orientation to upload", blocked(ExportState.PENDING, rotationSet = false))
+        for (state in ExportState.entries.filter { it != ExportState.DONE }) assertTrue(!blocked(state).startsWith("Synced"))
+    }
+
+    @Test fun anExportProblemExplainsItselfInTheDialog() {
+        val offProtocol = summary(SessionCloudStatus.EXPORT_BLOCKED).copy(exportState = ExportState.OFF_PROTOCOL, exportNote = "Recorded at 1280x720.")
+        assertTrue(CloudUiText.missingExportDetail(offProtocol)!!.contains("Recorded at 1280x720."))
+        assertTrue(CloudUiText.missingExportDetail(offProtocol)!!.contains("not uploaded"))
+        assertNull(CloudUiText.missingExportDetail(summary(SessionCloudStatus.SYNCED).copy(exportState = ExportState.DONE)))
+    }
+
+    // ---- redo takes, incomplete recordings, and campaigns the marketplace did not count -----------
+
+    @Test fun aRedoTakeOrAnIncompleteRecordingIsNeverOfferedForUpload() {
+        for (status in listOf(null, SessionCloudStatus.LOCAL_ONLY, SessionCloudStatus.AWAITING_CAMPAIGN)) {
+            val s = status?.let { summary(it) }
+            assertEquals("Not uploaded: redo take", CloudUiText.rowStatus(s, SyncPolicy.WIFI_ONLY, false, true, null, "redo take"))
+            assertEquals("Not uploaded: recording incomplete", CloudUiText.rowStatus(s, SyncPolicy.WIFI_ONLY, false, true, null, "recording incomplete"))
+        }
+        // Without a reason the same rows are what they were.
+        assertEquals("Choose a campaign to upload", row(summary(SessionCloudStatus.AWAITING_CAMPAIGN)))
+    }
+
+    @Test fun aNotCountedRecordingIsStillSyncedAndSaysWhyInPlainWords() {
+        fun syncedAs(reason: String?) = summary(SessionCloudStatus.SYNCED)
+            .copy(publishState = PublishState.UNSUPPORTED, marketplaceStatus = "NOT_COUNTED", marketplaceReason = reason)
+        assertEquals("Synced · not counted: the campaign was already full", row(syncedAs("CAMPAIGN_FULL")))
+        assertEquals("Synced · not counted: the campaign had closed", row(syncedAs("CAMPAIGN_CLOSED")))
+        assertEquals("Synced · not counted: it was already uploaded", row(syncedAs("DUPLICATE")))
+        assertEquals("Synced · not counted", row(syncedAs(null)))
+        assertEquals("Synced", row(summary(SessionCloudStatus.SYNCED).copy(publishState = PublishState.UNSUPPORTED, marketplaceStatus = "CHECKING")))
+    }
+
+    @Test fun theTakeDialogTellsWhatHappensToTheTake() {
+        assertEquals("Kitchen: waiting for Wi-Fi to upload.", CloudUiText.uploadingToMessage("Kitchen", SyncPolicy.WIFI_ONLY, networkOk = false))
+        assertEquals("Uploading to Kitchen (Wi-Fi only).", CloudUiText.uploadingToMessage("Kitchen", SyncPolicy.WIFI_ONLY, networkOk = true))
+        assertEquals("Uploading to Kitchen (any network).", CloudUiText.uploadingToMessage("Kitchen", SyncPolicy.ANY_NETWORK, networkOk = true))
+        assertEquals("Kitchen: upload is manual, use Recordings to start it.", CloudUiText.uploadingToMessage("Kitchen", SyncPolicy.MANUAL_ONLY, networkOk = true))
+        assertTrue(CloudUiText.notUploadedTakeMessage(redo = true, complete = true)!!.startsWith("Not uploaded"))
+        assertTrue(CloudUiText.notUploadedTakeMessage(redo = false, complete = false)!!.contains("incomplete"))
+        assertNull(CloudUiText.notUploadedTakeMessage(redo = false, complete = true))
+    }
+
+    @Test fun theCampaignChooserIsTheOnlyWayToUploadAnOlderRecording() {
+        assertEquals("Choose a campaign to upload…", CloudUiText.chooseCampaignLabel(hasCampaign = false))
+        assertEquals("Change campaign…", CloudUiText.chooseCampaignLabel(hasCampaign = true))
+        assertNull(CloudUiText.actionLabel(CloudCardAction.CHOOSE_CAMPAIGN))
     }
 
     private fun synced(state: PublishState, sets: Int = 0, note: String? = null) =
@@ -49,9 +111,9 @@ class CloudUiTextTest {
         assertEquals("Synced · no export (off protocol)", row(offProtocol))
     }
 
-    @Test fun deleteWarningSaysWhetherItIsOnTheWebsite() {
-        assertTrue(CloudUiText.deleteWarning(true, synced(PublishState.DONE, sets = 1)).contains("live on the website"))
-        assertTrue(CloudUiText.deleteWarning(true, synced(PublishState.PENDING)).contains("may not be on the website yet"))
+    @Test fun deleteWarningDoesNotPromiseTheWebsite() {
+        assertTrue(CloudUiText.deleteWarning(true, synced(PublishState.UNSUPPORTED)).contains("only frees space on this phone"))
+        assertTrue(CloudUiText.deleteWarning(true, summary(SessionCloudStatus.OTHER_ACCOUNT)).contains("another account"))
     }
 
     @Test fun pendingWorkThatCannotStartReadsWaitingForWifi() {
@@ -73,31 +135,35 @@ class CloudUiTextTest {
         assertEquals("Queued · retry: HTTP 500 INTERNAL: boom", queued("HTTP 500 INTERNAL: boom"))
     }
 
-    @Test fun theChosenPipeIsShownOnEveryFiledRecording() {
-        fun withPipe(status: SessionCloudStatus, waiting: Boolean = false) =
-            CloudUiText.rowStatus(summary(status, done = 45, total = 100), SyncPolicy.WIFI_ONLY, waiting, true, "White pipe")
-        assertEquals("White pipe · Uploading 45%", withPipe(SessionCloudStatus.UPLOADING))
-        assertEquals("White pipe · Queued", withPipe(SessionCloudStatus.PENDING))
-        assertEquals("White pipe · Waiting for Wi-Fi", withPipe(SessionCloudStatus.PENDING, waiting = true))
-        assertEquals("White pipe · Verifying", withPipe(SessionCloudStatus.VERIFYING))
-        assertEquals("White pipe · Upload failed", withPipe(SessionCloudStatus.FAILED))
-        assertEquals("White pipe · Done · live", live(withPipe = "White pipe"))
-        assertEquals("Done · live", live(withPipe = null))
+    @Test fun theCampaignIsShownOnEveryFiledRecording() {
+        fun withCampaign(status: SessionCloudStatus, waiting: Boolean = false) =
+            CloudUiText.rowStatus(summary(status, done = 45, total = 100), SyncPolicy.WIFI_ONLY, waiting, true, "Kitchen tidy")
+        assertEquals("Kitchen tidy · Uploading 45%", withCampaign(SessionCloudStatus.UPLOADING))
+        assertEquals("Kitchen tidy · Queued", withCampaign(SessionCloudStatus.PENDING))
+        assertEquals("Kitchen tidy · Waiting for Wi-Fi", withCampaign(SessionCloudStatus.PENDING, waiting = true))
+        assertEquals("Kitchen tidy · Verifying", withCampaign(SessionCloudStatus.VERIFYING))
+        assertEquals("Kitchen tidy · Upload failed", withCampaign(SessionCloudStatus.FAILED))
+        assertEquals("Kitchen tidy · Synced", synced(withCampaign = "Kitchen tidy"))
+        assertEquals("Synced", synced(withCampaign = null))
     }
 
-    private fun live(withPipe: String?) = CloudUiText.rowStatus(
+    private fun synced(withCampaign: String?) = CloudUiText.rowStatus(
         SessionCloudSummary(
             "capture-x", SessionCloudStatus.SYNCED, 4, 4, 100, 100, null,
-            exportState = ExportState.DONE, publishState = PublishState.DONE, publishedSets = 1,
+            exportState = ExportState.DONE, publishState = PublishState.UNSUPPORTED,
         ),
-        SyncPolicy.WIFI_ONLY, false, true, withPipe,
+        SyncPolicy.WIFI_ONLY, false, true, withCampaign,
     )
 
-    @Test fun noPipeLabelMeansTheLineIsUnchanged() {
+    @Test fun noCampaignOrAnotherAccountsRecordingNamesNoCampaign() {
         assertEquals("Uploading 45%", row(summary(SessionCloudStatus.UPLOADING, done = 45, total = 100)))
         assertEquals(
-            "Choose a pipe",
-            CloudUiText.rowStatus(summary(SessionCloudStatus.AWAITING_PIPE), SyncPolicy.WIFI_ONLY, false, true, "White pipe"),
+            "Choose a campaign to upload",
+            CloudUiText.rowStatus(summary(SessionCloudStatus.AWAITING_CAMPAIGN), SyncPolicy.WIFI_ONLY, false, true, "Kitchen tidy"),
+        )
+        assertEquals(
+            "Belongs to another account",
+            CloudUiText.rowStatus(summary(SessionCloudStatus.OTHER_ACCOUNT), SyncPolicy.WIFI_ONLY, false, true, "Kitchen tidy"),
         )
     }
 
@@ -118,10 +184,11 @@ class CloudUiTextTest {
         assertEquals("", CloudUiText.storageSummary(emptyList()))
         assertEquals("", CloudUiText.storageSummary(listOf(summary(SessionCloudStatus.LOCAL_ONLY))))
         assertEquals(
-            "2 synced, 3 waiting, 1 failed",
+            "2 synced, 3 waiting, 1 failed, 1 need a campaign, 1 for another account",
             CloudUiText.storageSummary(
                 listOf(SessionCloudStatus.SYNCED, SessionCloudStatus.SYNCED, SessionCloudStatus.PENDING, SessionCloudStatus.UPLOADING,
-                    SessionCloudStatus.WAITING_FOR_WIFI, SessionCloudStatus.FAILED).map { summary(it) },
+                    SessionCloudStatus.WAITING_FOR_WIFI, SessionCloudStatus.FAILED, SessionCloudStatus.AWAITING_CAMPAIGN,
+                    SessionCloudStatus.OTHER_ACCOUNT).map { summary(it) },
             ),
         )
     }

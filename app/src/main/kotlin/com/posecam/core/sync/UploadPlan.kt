@@ -35,11 +35,16 @@ class UploadStaging(private val root: File) {
 }
 
 object UploadPlan {
-    /** Everything uploadable in a finished session: its plain files plus one row per frame chunk. */
-    fun forSession(sessionId: String, directory: File, staging: UploadStaging): List<QueuedFile> {
-        val plain = CloudFileRules.listPlainUploadable(directory).map {
+    /**
+     * What a finished session uploads: `manifest.json` and `device.json` always; with [includeRaw] (the campaign collects
+     * raw data) also the intrinsics, poses, frame metadata and IMU files plus one row per frame chunk. Without it the raw
+     * files are not queued at all. The pipeline export is queued separately, once it is made ([forExport]).
+     */
+    fun forSession(sessionId: String, directory: File, staging: UploadStaging, includeRaw: Boolean): List<QueuedFile> {
+        val plain = CloudFileRules.listPlainUploadable(directory).filter { CloudFileRules.isRequired(it.name, includeRaw) }.map {
             QueuedFile(it.name, it.absolutePath, UploadSourceKind.PLAIN, it.length())
         }
+        if (!includeRaw) return plain
         val chunks = FrameChunks.plan(File(directory, "frames")).map {
             QueuedFile(
                 relativePath = it.relativePath,

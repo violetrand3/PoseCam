@@ -27,7 +27,7 @@ class LocalRetentionManagerTest {
     /** A fully uploaded + verified + SYNCED session at [syncedAt]. */
     private suspend fun syncedSession(id: String, syncedAt: Long = f.now): File {
         val dir = f.sessionDir(id)
-        val files = listOf("intrinsics.json", "poses.csv").map { f.file(dir, it, "data-$it") }
+        val files = listOf("intrinsics.json", "poses.csv", "device.json").map { f.file(dir, it, "data-$it") }
         val manifest = File(dir, "manifest.json")
         val manifestFile = QueuedFile("manifest.json", manifest.absolutePath, UploadSourceKind.PLAIN, manifest.length())
         f.queueFinalized(dir, *(files + manifestFile).toTypedArray())
@@ -38,6 +38,89 @@ class LocalRetentionManagerTest {
         f.repo.markSessionSynced(id)
         f.repo.recordPublish(id, PublishState.DONE, 1, null)
         return dir
+    }
+
+    /** A recording of a campaign that does not collect raw data: manifest, device and the export are all that was sent. */
+    private suspend fun syncedWithoutRaw(id: String): File {
+        val dir = f.sessionDir(id)
+        f.repo.registerSession(id, dir, SyncFixture.CAMPAIGN, rawRequired = false, accountId = SyncFixture.ACCOUNT)
+        f.frames(dir, 40)
+        f.file(dir, "poses.csv", "poses")
+        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging, includeRaw = false))
+        f.repo.markSessionCreated(id)
+        f.repo.completeExport(id, exportFiles(id))
+        f.repo.uploadsForSession(id).forEach {
+            f.repo.markPreparing(it.id); f.repo.markUploading(it.id); f.repo.markUploaded(it.id); f.repo.markVerified(it.id)
+        }
+        f.repo.markSessionSynced(id, com.posecam.core.cloud.CloudSessionView(id, null, null, null, "SYNCED", 0, 0, 0, 0, null))
+        return dir
+    }
+
+    private fun exportFiles(id: String): List<QueuedFile> {
+        val stem = "2026-09-17-09_00_05-a3f9c1-s1"
+        return listOf("RGB_$stem.mp4", "AR_Pose_$stem.txt", "posecam_export.json").map {
+            QueuedFile("export/$stem/$it", "/staging/$id/export/$stem/$it", UploadSourceKind.EXPORT, 5)
+        }
+    }
+
+    @Test
+    fun aRecordingOfACampaignWithoutRawIsDeletableRightAfterSyncedAndItsExportIsVerified() = runBlocking {
+        val dir = syncedWithoutRaw("s1")
+
+        // The marketplace never reports publishing: UNSUPPORTED is the normal case and waits for nothing.
+        assertEquals(PublishState.UNSUPPORTED, f.repo.session("s1")!!.publishState)
+        assertEquals(setOf("device.json", "manifest.json"), f.repo.uploadsForSession("s1").filter { it.kind == UploadSourceKind.PLAIN }.map { it.relativePath }.toSet())
+        // The raw frames and poses were intentionally not uploaded; they count as covered.
+        assertNull(manager().blockedReason(f.repo.session("s1")!!))
+        assertEquals(listOf("s1"), manager().deleteAllSynced().deletedSessions)
+        assertFalse(dir.exists())
+    }
+
+    @Test
+    fun theSameRecordingIsKeptUntilItsExportIsVerified() = runBlocking {
+        syncedWithoutRaw("s1")
+        val export = f.repo.uploadsForSession("s1").first { it.kind == UploadSourceKind.EXPORT }
+        f.repo.resetToPending(export.id, "re-uploading")
+
+        assertEquals(RetentionBlock.FILES_NOT_VERIFIED, manager().blockedReason(f.repo.session("s1")!!))
+    }
+
+    @Test
+    fun aRecordingWhoseExportWasNeverMadeIsNotDeletableEvenIfSomehowMarkedSynced() = runBlocking {
+        syncedWithoutRaw("s1")
+        f.dao.updateSession(f.repo.session("s1")!!.copy(exportState = ExportState.PENDING))
+
+        assertEquals(RetentionBlock.EXPORT_PENDING, manager().blockedReason(f.repo.session("s1")!!))
+    }
+
+    @Test
+    fun aCampaignThatCollectsRawKeepsTheOldFrameCoverageRules() = runBlocking {
+        val dir = syncedSession("s1") // rawRequired = true: every file was uploaded
+        File(dir, "frames").mkdirs()
+        File(dir, "frames/000000_1.jpg").writeBytes(byteArrayOf(1)) // a JPEG that is in no verified chunk
+
+        assertEquals(RetentionBlock.FRAMES_NOT_COVERED, manager().blockedReason(f.repo.session("s1")!!))
+    }
+
+    @Test
+    fun aRawFileOnDiskThatWasNotUploadedBlocksDeletionOnlyWhenTheCampaignCollectsRaw() = runBlocking {
+        val withRaw = syncedSession("s1")
+        File(withRaw, "imu.csv").writeText("never uploaded")
+        assertEquals(RetentionBlock.LOCAL_FILE_NOT_COVERED, manager().blockedReason(f.repo.session("s1")!!))
+
+        val withoutRaw = syncedWithoutRaw("s2")
+        File(withoutRaw, "imu.csv").writeText("intentionally not uploaded")
+        assertNull(manager().blockedReason(f.repo.session("s2")!!))
+    }
+
+    @Test
+    fun aRecordingThatWasNotCountedIsStillSyncedSoThePhoneMayFreeIt() = runBlocking {
+        val dir = syncedWithoutRaw("s1")
+        f.dao.updateSession(f.repo.session("s1")!!.copy(marketplaceStatus = "NOT_COUNTED", marketplaceReason = "CAMPAIGN_FULL"))
+
+        assertNull(manager().blockedReason(f.repo.session("s1")!!))
+        assertEquals(listOf("s1"), manager().deleteAllSynced().deletedSessions)
+        assertFalse(dir.exists())
     }
 
     @Test

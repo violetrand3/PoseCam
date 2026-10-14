@@ -12,12 +12,12 @@ data class QueueRecoveryReport(
 
 /**
  * Rebuilds and resumes the upload queue on app start. It makes the queue self-healing after process
- * death, reboot, force-stop or any missed enqueue, and it adopts recordings made before cloud upload
- * existed (which can be a large backlog: the first launch after an update may start a long upload).
+ * death, reboot, force-stop or any missed enqueue. Recordings made before cloud upload existed, or before they had a
+ * campaign, get a session row but no files: nothing is uploaded for them until the collector chooses a campaign.
  *
  * PoseCam never records without its capture screen in the foreground, so after a cold start nothing is
  * being written. A session whose manifest says `"complete": false` is therefore a take that was killed,
- * not one in progress, and is queued as `incomplete` (evidence, never a deliverable).
+ * not one in progress, and is recorded as `incomplete` (never uploaded: the marketplace does not accept it).
  *
  * Safety rules:
  *  * A session is queued only if no writer for it is open in this process, so a file that is still being
@@ -51,9 +51,15 @@ class UploadQueueRecovery(
                 skipped++
                 continue
             }
-            val files = UploadPlan.forSession(info.sessionId, directory, staging)
+            // Only a good, complete recording that has a campaign is queued, with the files its campaign collects.
+            val session = repository.session(info.sessionId)
+            val files = if (info.eligibleForUpload && session?.pipe != null) {
+                UploadPlan.forSession(info.sessionId, directory, staging, includeRaw = session.rawRequired)
+            } else {
+                emptyList()
+            }
             val before = repository.uploadsForSession(info.sessionId).size
-            repository.finalizeSession(info.sessionId, directory, info.recordingStatus, files)
+            repository.finalizeSession(info.sessionId, directory, info.recordingStatus, files, info.eligibleForUpload)
             queued += repository.uploadsForSession(info.sessionId).size - before
         }
 

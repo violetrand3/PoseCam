@@ -34,18 +34,19 @@ interface UploadDao {
     /**
      * Files a worker can still make progress on, oldest first. Only files of sessions the
      * backend knows about (and has not refused) are returned: a file can't be uploaded into a
-     * session that does not exist remotely.
+     * session that does not exist remotely. And only files of [accountId]'s sessions: another account's recordings are
+     * never uploaded by whoever happens to be signed in.
      */
     @Query(
         """
         SELECT u.* FROM uploads u
         JOIN cloud_sessions s ON s.sessionId = u.sessionId
         WHERE u.state IN ('PENDING', 'PREPARING', 'UPLOADING', 'UPLOADED')
-          AND s.cloudCreated = 1 AND s.permanentFailure = 0
+          AND s.cloudCreated = 1 AND s.permanentFailure = 0 AND s.accountId = :accountId
         ORDER BY u.createdAt, u.id
         """,
     )
-    suspend fun runnableUploads(): List<UploadEntity>
+    suspend fun runnableUploads(accountId: String): List<UploadEntity>
 
     @Query("SELECT MIN(createdAt) FROM uploads WHERE state IN ('PENDING', 'PREPARING', 'UPLOADING', 'UPLOADED')")
     suspend fun minRunnableCreatedAt(): Long?
@@ -91,7 +92,7 @@ interface UploadDao {
                SUM(CASE WHEN state = 'VERIFIED' THEN 1 ELSE 0 END) AS verifiedFiles,
                SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) AS failedFiles
         FROM uploads
-        WHERE required = 0
+        WHERE kind = 'EXPORT'
         GROUP BY sessionId
         """,
     )
@@ -114,15 +115,31 @@ interface UploadDao {
     @Query("SELECT * FROM cloud_sessions")
     fun observeSessions(): Flow<List<CloudSessionEntity>>
 
-    /** A session is created in the cloud only once its pipe is known: the pipe is the folder everything goes into. */
-    @Query("SELECT * FROM cloud_sessions WHERE cloudCreated = 0 AND permanentFailure = 0 AND pipe IS NOT NULL")
-    suspend fun sessionsNeedingCreation(): List<CloudSessionEntity>
+    /**
+     * Sessions the backend does not know yet. Only once the recording is finished (a take in progress already has its
+     * campaign, but must not be offered to the backend before it is judged), the campaign is known, and only [accountId]'s.
+     */
+    @Query(
+        """
+        SELECT * FROM cloud_sessions
+        WHERE cloudCreated = 0 AND permanentFailure = 0 AND recordingFinal = 1 AND pipe IS NOT NULL AND accountId = :accountId
+        """,
+    )
+    suspend fun sessionsNeedingCreation(accountId: String): List<CloudSessionEntity>
 
-    /** Finalized sessions whose required files are all verified but not yet confirmed SYNCED. */
+    /** Rows made before accounts were tracked belong to the first account that signs in afterwards. Returns how many. */
+    @Query("UPDATE cloud_sessions SET accountId = :accountId WHERE accountId IS NULL")
+    suspend fun adoptUnowned(accountId: String): Int
+
+    /**
+     * [accountId]'s finalized sessions whose required files are all verified but not yet confirmed SYNCED. The pipeline
+     * export is one of the required files, so a recording whose export is missing (off protocol, not made yet) is never here.
+     */
     @Query(
         """
         SELECT s.* FROM cloud_sessions s
         WHERE s.recordingFinal = 1 AND s.cloudCreated = 1 AND s.permanentFailure = 0 AND s.syncedAt IS NULL
+          AND s.accountId = :accountId AND s.exportState = 'DONE'
           AND EXISTS (SELECT 1 FROM uploads u WHERE u.sessionId = s.sessionId AND u.required = 1)
           AND NOT EXISTS (
               SELECT 1 FROM uploads u
@@ -130,19 +147,21 @@ interface UploadDao {
           )
         """,
     )
-    suspend fun sessionsReadyToComplete(): List<CloudSessionEntity>
+    suspend fun sessionsReadyToComplete(accountId: String): List<CloudSessionEntity>
 
     /**
-     * Finalized, filed recordings whose pipeline export is still to be made. A recording the collector has not filed yet
-     * is left alone (nothing about it is sent or produced), and so is one the backend refused.
+     * Finalized recordings that have a campaign and whose pipeline export is still to be made. A recording without a
+     * campaign is left alone (nothing about it is sent or produced), and so is one the backend refused. [accountId] null
+     * means every account's: the export is local work, nothing is sent.
      */
     @Query(
         """
         SELECT * FROM cloud_sessions
         WHERE exportState = 'PENDING' AND recordingFinal = 1 AND permanentFailure = 0 AND pipe IS NOT NULL
+          AND (:accountId IS NULL OR accountId = :accountId)
         """,
     )
-    suspend fun sessionsNeedingExport(): List<CloudSessionEntity>
+    suspend fun sessionsNeedingExport(accountId: String?): List<CloudSessionEntity>
 
     @Query("DELETE FROM cloud_sessions WHERE sessionId = :sessionId")
     suspend fun deleteSession(sessionId: String)

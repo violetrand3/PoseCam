@@ -42,7 +42,76 @@ class UploadRepositoryTest {
         assertEquals(UploadFileType.TABLE, segment.fileType)
         assertTrue(segment.required)
         assertEquals("abc", segment.sha256)
-        assertFalse(f.row("s1", "export/2026-09-17-09_00_00-a3f9c1-s1/posecam_export.json").required)
+        assertTrue(f.row("s1", "export/2026-09-17-09_00_00-a3f9c1-s1/posecam_export.json").required) // the export holds up SYNCED
+    }
+
+    @Test
+    fun rawFilesOfARecordingWhoseCampaignDoesNotCollectThemAreNotRequired() = runBlocking {
+        val dir = f.sessionDir("s1")
+        f.repo.registerSession("s1", dir, SyncFixture.CAMPAIGN, rawRequired = false, accountId = SyncFixture.ACCOUNT)
+        f.repo.enqueue(f.file(dir, "manifest.json", "{}"))
+        f.repo.enqueue(f.file(dir, "poses.csv", "frames"))
+
+        assertTrue(f.row("s1", "manifest.json").required)
+        assertFalse(f.row("s1", "poses.csv").required)
+    }
+
+    @Test
+    fun theAccountAndCampaignAreFixedWhenTheTakeStartsAndNothingElseOverwritesThem() = runBlocking {
+        f.dao.defaultPipe = null
+        f.dao.defaultAccountId = null
+        val dir = f.sessionDir("s1")
+        f.repo.registerSession("s1", dir, SyncFixture.CAMPAIGN, rawRequired = false, accountId = SyncFixture.ACCOUNT)
+
+        f.repo.registerSession("s1", dir, SyncFixture.CAMPAIGN_2, rawRequired = true, accountId = SyncFixture.OTHER_ACCOUNT) // a repeat
+        f.repo.finalizeSession("s1", dir, "complete", emptyList())
+
+        val session = f.repo.session("s1")!!
+        assertEquals(SyncFixture.CAMPAIGN, session.pipe)
+        assertEquals(SyncFixture.ACCOUNT, session.accountId)
+        assertFalse(session.rawRequired)
+    }
+
+    @Test
+    fun anotherAccountCannotTakeOverARecordingByChoosingACampaignForIt() = runBlocking {
+        f.dao.defaultPipe = null
+        val dir = f.sessionDir("s1")
+        f.repo.registerSession("s1", dir, null, true, SyncFixture.ACCOUNT)
+
+        assertFalse(f.repo.assignCampaign("s1", SyncFixture.CAMPAIGN, false, SyncFixture.OTHER_ACCOUNT))
+
+        assertNull(f.repo.session("s1")!!.pipe)
+        assertEquals(SyncFixture.ACCOUNT, f.repo.session("s1")!!.accountId)
+    }
+
+    @Test
+    fun anUnownedRecordingTakesTheAccountOfWhoeverFilesIt() = runBlocking {
+        f.dao.defaultPipe = null
+        f.dao.defaultAccountId = null
+        val dir = f.sessionDir("s1")
+        f.repo.registerSession("s1", dir, null, true, null)
+
+        assertTrue(f.repo.assignCampaign("s1", SyncFixture.CAMPAIGN, false, SyncFixture.ACCOUNT))
+
+        assertEquals(SyncFixture.ACCOUNT, f.repo.session("s1")!!.accountId)
+    }
+
+    @Test
+    fun retryFailedOnlyTouchesTheGivenAccountsRecordings() = runBlocking {
+        val mine = f.sessionDir("capture-20260917T090000-aaaaaa")
+        val theirs = f.sessionDir("capture-20260917T090000-bbbbbb")
+        f.repo.registerSession(mine.name, mine, SyncFixture.CAMPAIGN, true, SyncFixture.ACCOUNT)
+        f.repo.registerSession(theirs.name, theirs, SyncFixture.CAMPAIGN, true, SyncFixture.OTHER_ACCOUNT)
+        for (dir in listOf(mine, theirs)) {
+            f.queueFinalized(dir, f.file(dir, "device.json", "{}"))
+            val row = f.row(dir.name, "device.json")
+            f.repo.markPreparing(row.id); f.repo.markFailed(row.id, "x")
+        }
+
+        assertEquals(1, f.repo.retryFailed(null, SyncFixture.ACCOUNT))
+
+        assertEquals(UploadState.PENDING, f.row(mine.name, "device.json").state)
+        assertEquals(UploadState.FAILED, f.row(theirs.name, "device.json").state) // untouched
     }
 
     @Test

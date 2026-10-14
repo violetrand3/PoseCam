@@ -15,7 +15,11 @@ import java.util.concurrent.TimeUnit
 
 /**
  * OkHttp implementation of [CloudApi]. Adds `Authorization: Bearer <token>` only when the
- * [AuthProvider] returns a token, and `X-Device-Id` (the installation id, for observability).
+ * [AuthProvider] returns a token, and `X-Device-Id` (the installation id, which the recording endpoints require).
+ * A 401 refreshes the login once through the provider and retries the call once.
+ *
+ * The recording endpoints (`sessions/...`) answer with bare JSON; `me/campaigns` is a marketplace endpoint and answers
+ * with `{ok, data}`.
  */
 class CloudApiClient(
     private val config: CloudConfig,
@@ -25,16 +29,9 @@ class CloudApiClient(
 ) : CloudApi {
     private val baseUrl: HttpUrl = config.normalizedBaseUrl.toHttpUrl()
 
-    override suspend fun listPipes(): List<PipeInfo> = parsing {
-        val json = get(listOf("v1", "pipes"))
-        json.optJSONArray("pipes").toObjects().map {
-            PipeInfo(
-                id = it.requireString("id"),
-                label = it.requireString("label"),
-                color = it.optStringOrNull("color"),
-                order = it.optInt("order", Int.MAX_VALUE),
-            )
-        }
+    override suspend fun listCampaigns(): List<MyCampaign> = parsing {
+        val data = envelopeData(get(listOf("v1", "me", "campaigns")))
+        (data as? JSONArray).toObjects().map { it.toCampaign() }
     }
 
     override suspend fun createSession(request: CreateSessionRequest): CreateSessionResponse = parsing {
@@ -44,7 +41,11 @@ class CloudApiClient(
             .put("createdAt", request.createdAt)
             .put("recordingStatus", request.recordingStatus)
             .put("appVersion", request.appVersion ?: JSONObject.NULL)
-            .apply { request.pipe?.let { put("pipe", it) } }
+            .apply {
+                request.campaignId?.let { put("campaignId", it) }
+                request.deviceFingerprint?.let { put("deviceFingerprint", it) }
+                request.take?.let { put("take", it.toJson()) }
+            }
         val json = post(listOf("v1", "sessions"), body)
         CreateSessionResponse(
             session = json.requireObject("session").toSessionView(),
@@ -56,6 +57,8 @@ class CloudApiClient(
                     presignedUrlTtlSeconds = it.optLong("presignedUrlTtlSeconds"),
                 )
             },
+            rawRequired = json.optJSONObject("requirements")?.takeIf { it.has("rawRequired") && !it.isNull("rawRequired") }
+                ?.optBoolean("rawRequired"),
         )
     }
 
@@ -196,25 +199,20 @@ class CloudApiClient(
         listOf("v1", "sessions", sessionId, "uploads") + tail.split('/')
 
     private suspend fun post(path: List<String>, body: JSONObject): JSONObject =
-        execute(requestFor(path).post(body.toString().toRequestBody(JSON_MEDIA_TYPE)).build())
+        client.executeAuthed(authProvider) { token ->
+            requestFor(path, token).post(body.toString().toRequestBody(JSON_MEDIA_TYPE)).build()
+        }
 
-    private suspend fun get(path: List<String>): JSONObject = execute(requestFor(path).get().build())
+    private suspend fun get(path: List<String>): JSONObject =
+        client.executeAuthed(authProvider) { token -> requestFor(path, token).get().build() }
 
-    private suspend fun requestFor(path: List<String>): Request.Builder {
+    private fun requestFor(path: List<String>, token: String?): Request.Builder {
         val url = baseUrl.newBuilder().apply { path.forEach { addPathSegment(it) } }.build()
         return Request.Builder()
             .url(url)
             .header("Accept", "application/json")
             .header("X-Device-Id", installationId)
-            .apply { authProvider.getToken()?.let { header("Authorization", "Bearer $it") } }
-    }
-
-    private suspend fun execute(request: Request): JSONObject = try {
-        client.executeJson(request)
-    } catch (error: CloudHttpException) {
-        // The token was refused: the provider forgets it, so nothing is sent with a dead token again.
-        if (error.status == 401) authProvider.onUnauthorized()
-        throw error
+            .apply { token?.let { header("Authorization", "Bearer $it") } }
     }
 
     /** A response with an unexpected shape is a backend problem, never a crash in the worker. */
@@ -246,7 +244,53 @@ class CloudApiClient(
         publishedSets = optInt("publishedSets", 0),
         publishedAt = optStringOrNull("publishedAt"),
         publishError = optStringOrNull("publishError"),
+        marketplace = optJSONObject("marketplace")?.let {
+            MarketplaceInfo(
+                status = it.optString("status"),
+                reason = it.optStringOrNull("reason"),
+                submissionId = it.optStringOrNull("submissionId"),
+            )
+        },
     )
+
+    private fun TakeInfo.toJson() = JSONObject()
+        .put("verdict", verdict)
+        .put("reasons", JSONArray(reasons))
+        .put("durationSeconds", durationSeconds)
+        .put("poseJumps", poseJumps)
+        .put("longestTrackingLossFrames", longestTrackingLossFrames)
+
+    private fun JSONObject.toCampaign(): MyCampaign {
+        val progress = optJSONObject("progress")
+        return MyCampaign(
+            id = requireString("id"),
+            title = requireString("title"),
+            description = optString("description"),
+            instructions = optString("instructions"),
+            referenceInfo = optStringOrNull("referenceInfo"),
+            currency = optString("currency", "INR"),
+            rewardPerRecording = optLong("rewardPerRecording"),
+            rewardPoints = optLong("rewardPoints"),
+            rules = optJSONObject("rules")?.let {
+                CampaignRules(it.optInt("minDuration"), it.optInt("maxDuration"), it.optString("orientation", "ANY"))
+            },
+            collectRaw = optBoolean("collectRaw", false),
+            target = optInt("target"),
+            remaining = optInt("remaining"),
+            endDate = optStringOrNull("endDate"),
+            enrolledAt = optStringOrNull("enrolledAt"),
+            acceptingUploads = optBoolean("acceptingUploads", true),
+            status = optString("status", MyCampaign.STATUS_ACTIVE),
+            progress = CampaignProgress(
+                recorded = progress?.optInt("recorded") ?: 0,
+                inReview = progress?.optInt("inReview") ?: 0,
+                approved = progress?.optInt("approved") ?: 0,
+                rejected = progress?.optInt("rejected") ?: 0,
+                notCounted = progress?.optInt("notCounted") ?: 0,
+                earned = progress?.optLong("earned") ?: 0,
+            ),
+        )
+    }
 
     private fun JSONObject.requireObject(name: String): JSONObject =
         optJSONObject(name) ?: throw malformed("missing $name")

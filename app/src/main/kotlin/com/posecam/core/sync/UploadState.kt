@@ -60,9 +60,10 @@ enum class UploadSourceKind {
 }
 
 /**
- * Where a recording stands on its pipeline export (`RGB_<stem>.mp4` + `AR_Pose_<stem>.txt`, the files LabelNow turns into
- * a labelable video). The export is derived from the raw recording and never holds up SYNCED, but it is the part of the
- * upload that LabelNow actually uses, so every outcome other than [DONE] is shown to the collector.
+ * Where a recording stands on its pipeline export (`RGB_<stem>.mp4` + `AR_Pose_<stem>.txt` + `posecam_export.json` for
+ * every clean segment). The export is the deliverable the marketplace reviews and pays for, so it HOLDS UP SYNCED: a
+ * recording is only synced once its export exists and is verified. Every outcome other than [DONE] is shown to the
+ * collector with its reason, and the recording never claims to be synced.
  */
 enum class ExportState {
     /** Not exported yet (or interrupted by a take, or waiting for the rotation setting). Retried on every run. */
@@ -71,7 +72,7 @@ enum class ExportState {
     /** Exported and its files queued: from here on they are ordinary queue rows. */
     DONE,
 
-    /** The recording is off protocol (wrong size, fps, focus): it can never appear in LabelNow. Not retried. */
+    /** The recording is off protocol (wrong size, fps, focus): it can never be uploaded. Not retried. */
     OFF_PROTOCOL,
 
     /** The recording cannot be exported for another lasting reason (killed take, no clean stretch, frames missing). Not retried. */
@@ -86,8 +87,8 @@ enum class ExportState {
 }
 
 /**
- * Where a synced recording stands on its way to the website, as last reported by the backend. SYNCED only means the
- * files arrived; the backend then turns them into gallery cards, which takes a while and can fail.
+ * Where a synced recording stands on its way to the website, as last reported by the backend (LabelNow's, which turned the
+ * files into gallery cards). The marketplace backend does not report publishing, so [UNSUPPORTED] is the normal case now.
  */
 enum class PublishState {
     /** Not on the website yet (or not asked yet). Checked again until the backend answers. */
@@ -108,8 +109,20 @@ enum class SessionCloudStatus {
     /** Cloud sync is disabled/unconfigured, or the session has not been queued. */
     LOCAL_ONLY,
 
-    /** Finished recording whose pipe (cloud folder) the collector has not chosen yet: nothing is uploaded until they do. */
-    AWAITING_PIPE,
+    /**
+     * Finished recording with no campaign (an older recording, or one made before any campaign was active): nothing is
+     * uploaded until the collector chooses one. A redo take or an incomplete one never gets here: it is never uploaded.
+     */
+    AWAITING_CAMPAIGN,
+
+    /** Signed in as someone else: the recording belongs to another account and waits, untouched, for that account. */
+    OTHER_ACCOUNT,
+
+    /**
+     * Everything else is uploaded but the pipeline export is not (not made yet, the video rotation is unset, off protocol,
+     * not exportable, or it failed): the recording is not synced and the row says why.
+     */
+    EXPORT_BLOCKED,
     WAITING_FOR_WIFI,
     PENDING,
     UPLOADING,

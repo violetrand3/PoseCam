@@ -11,8 +11,10 @@ import org.junit.Test
 import java.io.File
 
 /**
- * A filed recording's pipeline export (`RGB_<stem>.mp4` + `AR_Pose_<stem>.txt`) is made on the phone, queued as `export/<stem>/...`
- * rows, and uploaded with the raw files. Failing to export must never fail the session, and must never be silent.
+ * A filed recording's pipeline export (`RGB_<stem>.mp4` + `AR_Pose_<stem>.txt` + `posecam_export.json`) is made on the phone,
+ * queued as `export/<stem>/...` rows, and uploaded with the other files. It is what the marketplace reviews and pays for, so it
+ * HOLDS UP SYNCED: a recording whose export is impossible says why and never claims to be synced. Failing to export must
+ * never fail the session for good (a crash can be retried), and must never be silent.
  */
 class PipelineExportUploadTest {
     private val f = SyncFixture()
@@ -44,7 +46,7 @@ class PipelineExportUploadTest {
     private val stage = PipelineExportStage(f.repo, f.staging, exporter, { rotation }, isRecording = { f.recording })
     private val processor = UploadProcessor(
         f.repo, f.api, f.s3, FileHasher(), { "install-1" }, "test", f.materializer,
-        isRecording = { f.recording }, exportStage = stage,
+        isRecording = { f.recording }, exportStage = stage, account = AccountScope.fixed(SyncFixture.ACCOUNT),
     )
 
     init {
@@ -52,11 +54,12 @@ class PipelineExportUploadTest {
         f.dao.defaultExportState = ExportState.PENDING // production: a new recording's export is still to be made
     }
 
-    private suspend fun filedRecording(): File {
+    private suspend fun filedRecording(rawRequired: Boolean = true, campaign: String? = SyncFixture.CAMPAIGN): File {
         val dir = f.sessionDir(id)
+        f.repo.registerSession(id, dir, campaign, rawRequired, SyncFixture.ACCOUNT)
         listOf("poses.csv", "intrinsics.json").forEach { f.file(dir, it, "data-$it") }
         f.frames(dir, 12)
-        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging))
+        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging, includeRaw = rawRequired))
         return dir
     }
 
@@ -87,22 +90,54 @@ class PipelineExportUploadTest {
         assertNotNull(f.repo.session(id)!!.syncedAt)
         assertEquals(ExportState.DONE, f.repo.session(id)!!.exportState)
         assertEquals(listOf(90), exportCalls)
-        // Uploaded is not the website: "Done" waits for the backend to say it published the recording.
-        assertEquals("Uploaded · publishing…", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
-        f.repo.recordPublish(id, PublishState.DONE, 2, null)
-        assertEquals("Done · live", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
+        // The marketplace does not report publishing: nothing waits for it, and what it made of the recording is kept.
+        assertEquals(PublishState.UNSUPPORTED, f.repo.session(id)!!.publishState)
+        assertEquals("CHECKING", f.repo.session(id)!!.marketplaceStatus)
+        assertEquals("Synced", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
     }
 
     @Test
-    fun exportRowsAreNotRequiredAndDoNotCountTowardTheSessionTotals() = runBlocking {
+    fun theSessionCompletesOnlyAfterEveryExportFileIsVerified() = runBlocking {
+        filedRecording()
+        f.repo.markSessionCreated(id)
+
+        processor.runQueue()
+
+        val complete = f.api.calls.indexOf("completeSession:$id")
+        assertTrue(complete >= 0)
+        val exportVerifies = f.api.calls.withIndex().filter { it.value.startsWith("verify:export/") }
+        assertEquals(6, exportVerifies.size)
+        assertTrue("completed before an export file was verified", exportVerifies.all { it.index < complete })
+        // And the claimed files include the export, so the backend can check them.
+        assertEquals(6, f.api.completedSessions.single().count { it.relativePath.startsWith("export/") })
+    }
+
+    @Test
+    fun aCampaignWithoutRawUploadsOnlyManifestDeviceAndTheExportAndSyncs() = runBlocking {
+        filedRecording(rawRequired = false)
+        f.repo.markSessionCreated(id)
+
+        assertEquals(QueueRunResult.DONE, processor.runQueue())
+
+        assertEquals(
+            setOf("manifest.json", "device.json") + f.repo.uploadsForSession(id).filter { it.kind == UploadSourceKind.EXPORT }.map { it.relativePath },
+            f.api.verified.toSet(),
+        )
+        assertTrue(f.api.verified.none { it == "poses.csv" || it == "intrinsics.json" || it.startsWith("frames-") })
+        assertNotNull(f.repo.session(id)!!.syncedAt)
+        assertEquals(8, f.api.completedSessions.single().size) // 2 + 2 segments x 3
+    }
+
+    @Test
+    fun exportRowsAreRequiredAndCountTowardTheSessionTotals() = runBlocking {
         filedRecording()
         f.repo.markSessionCreated(id)
         stage.runPending()
 
         val exports = f.repo.uploadsForSession(id).filter { it.kind == UploadSourceKind.EXPORT }
         assertEquals(6, exports.size)
-        assertTrue(exports.none { it.required })
-        assertTrue(f.dao.aggregates().single().totalFiles == f.repo.uploadsForSession(id).count { it.required })
+        assertTrue(exports.all { it.required })
+        assertEquals(f.repo.uploadsForSession(id).size, f.dao.aggregates().single().totalFiles)
     }
 
     @Test
@@ -112,7 +147,7 @@ class PipelineExportUploadTest {
 
         stage.runPending()
 
-        val order = f.repo.runnable().map { it.relativePath }
+        val order = f.repo.runnable(SyncFixture.ACCOUNT).map { it.relativePath }
         assertTrue(order.take(6).all { it.startsWith("export/") })
         assertTrue(order.drop(6).none { it.startsWith("export/") })
     }
@@ -147,9 +182,9 @@ class PipelineExportUploadTest {
         stage.runPending()
 
         assertEquals(ExportState.DONE, f.repo.session(id)!!.exportState)
-        assertTrue(f.repo.runnable().isEmpty())
+        assertTrue(f.repo.runnable(SyncFixture.ACCOUNT).isEmpty())
         f.repo.markSessionCreated(id)
-        assertEquals(6, f.repo.runnable().count { it.relativePath.startsWith("export/") })
+        assertEquals(6, f.repo.runnable(SyncFixture.ACCOUNT).count { it.relativePath.startsWith("export/") })
     }
 
     // ---- rotation is a setting -----------------------------------------------------------------
@@ -165,9 +200,12 @@ class PipelineExportUploadTest {
 
         assertTrue(exportCalls.isEmpty())
         assertEquals(ExportState.PENDING, f.repo.session(id)!!.exportState)
-        assertNotNull("the raw upload carries on", f.repo.session(id)!!.syncedAt)
+        assertTrue("the other files carry on", f.repo.uploadsForSession(id).all { it.state == UploadState.VERIFIED })
+        assertNull("but the recording is not synced without its export", f.repo.session(id)!!.syncedAt)
+        assertEquals(0, f.api.callsTo("completeSession"))
+        assertEquals(SessionCloudStatus.EXPORT_BLOCKED, summary().status)
         assertEquals(
-            "Synced · set video rotation",
+            "Set the video orientation to upload",
             CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false, exportRotationSet = false),
         )
 
@@ -177,6 +215,7 @@ class PipelineExportUploadTest {
         assertEquals(listOf(270), exportCalls)
         assertEquals(ExportState.DONE, f.repo.session(id)!!.exportState)
         assertEquals(6, f.repo.uploadsForSession(id).count { it.state == UploadState.VERIFIED && it.fileType == UploadFileType.EXPORT })
+        assertNotNull(f.repo.session(id)!!.syncedAt)
     }
 
     // ---- what is exported ----------------------------------------------------------------------
@@ -184,7 +223,7 @@ class PipelineExportUploadTest {
     @Test
     fun aRecordingNobodyHasFiledIsNeitherExportedNorUploaded() = runBlocking {
         f.dao.defaultPipe = null
-        filedRecording()
+        filedRecording(campaign = null)
 
         processor.runQueue()
 
@@ -210,7 +249,7 @@ class PipelineExportUploadTest {
     // ---- failures never fail the session -------------------------------------------------------
 
     @Test
-    fun anOffProtocolRecordingStillSyncsItsRawFilesAndSaysItHasNoExport() = runBlocking {
+    fun anOffProtocolRecordingIsNeverSyncedAndSaysWhy() = runBlocking {
         exporterBehavior = {
             throw PipelineExporter.ExportException(
                 "This recording was recorded at 640x360, not the team's 640x480. It cannot be mixed with the rest of the dataset, so it is not exported.",
@@ -222,11 +261,12 @@ class PipelineExportUploadTest {
 
         assertEquals(QueueRunResult.DONE, processor.runQueue())
 
-        assertNotNull("SYNCED without the export", f.repo.session(id)!!.syncedAt)
-        assertEquals(SessionCloudStatus.SYNCED, summary().status)
+        assertNull("SYNCED without the export", f.repo.session(id)!!.syncedAt)
+        assertEquals(0, f.api.callsTo("completeSession"))
+        assertEquals(SessionCloudStatus.EXPORT_BLOCKED, summary().status)
         assertTrue(f.repo.uploadsForSession(id).none { it.kind == UploadSourceKind.EXPORT })
         assertEquals(ExportState.OFF_PROTOCOL, f.repo.session(id)!!.exportState)
-        assertEquals("Synced · no export (off protocol)", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
+        assertEquals("Not uploaded: off protocol (wrong size, frame rate or focus)", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
         assertTrue(CloudUiText.missingExportDetail(summary())!!.contains("640x360"))
         assertFalse("not retried on every run", stage.hasWork())
         assertFalse(f.staging.exportRoot(id).exists())
@@ -243,12 +283,12 @@ class PipelineExportUploadTest {
 
         assertEquals(1, exportCalls.size)
         assertEquals(ExportState.NOT_EXPORTABLE, f.repo.session(id)!!.exportState)
-        assertEquals("Synced · no export", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
-        assertNotNull(f.repo.session(id)!!.syncedAt)
+        assertEquals("Not uploaded: it cannot be exported", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
+        assertNull(f.repo.session(id)!!.syncedAt)
     }
 
     @Test
-    fun aCrashedExportLeavesTheSessionSyncedAndCanBeRetried() = runBlocking {
+    fun aCrashedExportHoldsTheSessionBackButCanBeRetried() = runBlocking {
         var fail = true
         exporterBehavior = { root ->
             if (fail) throw java.io.IOException("No space left on device")
@@ -259,10 +299,11 @@ class PipelineExportUploadTest {
 
         assertEquals(QueueRunResult.DONE, processor.runQueue())
 
-        assertNotNull(f.repo.session(id)!!.syncedAt)
+        assertNull(f.repo.session(id)!!.syncedAt)
         assertEquals(ExportState.FAILED, f.repo.session(id)!!.exportState)
         assertEquals("No space left on device", f.repo.session(id)!!.exportNote)
-        assertEquals("Synced · export failed", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
+        assertEquals("Not uploaded: export failed", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
+        assertTrue(summary().needsFileRetry)
         assertFalse("a crash is not retried on its own", stage.hasWork())
 
         fail = false
@@ -272,21 +313,22 @@ class PipelineExportUploadTest {
 
         assertEquals(ExportState.DONE, f.repo.session(id)!!.exportState)
         assertEquals(3, f.repo.uploadsForSession(id).count { it.kind == UploadSourceKind.EXPORT && it.state == UploadState.VERIFIED })
+        assertNotNull(f.repo.session(id)!!.syncedAt)
     }
 
     @Test
-    fun anExportFileThatCannotBeUploadedDoesNotUnsyncTheSession_butIsShown() = runBlocking {
+    fun anExportFileThatCannotBeUploadedKeepsTheSessionFromSyncing_andIsShown() = runBlocking {
         filedRecording()
         f.repo.markSessionCreated(id)
         f.api.failOnceFor("requestUpload", "export/$stem1/RGB_$stem1.mp4", http(403, "PATH_NOT_ALLOWED"))
 
         processor.runQueue()
 
-        assertNotNull(f.repo.session(id)!!.syncedAt)
+        assertNull(f.repo.session(id)!!.syncedAt)
         val failed = f.repo.uploadsForSession(id).single { it.state == UploadState.FAILED }
         assertEquals("export/$stem1/RGB_$stem1.mp4", failed.relativePath)
-        assertEquals(SessionCloudStatus.SYNCED, summary().status)
-        assertEquals("Synced · export upload failed", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
+        assertEquals(SessionCloudStatus.FAILED, summary().status)
+        assertEquals("Upload failed", CloudUiText.rowStatus(summary(), SyncPolicy.WIFI_ONLY, false))
     }
 
     @Test
@@ -299,7 +341,7 @@ class PipelineExportUploadTest {
 
         assertTrue(f.repo.uploadsForSession(id).none { it.kind == UploadSourceKind.EXPORT })
         assertEquals(ExportState.FAILED, f.repo.session(id)!!.exportState)
-        assertNotNull(f.repo.session(id)!!.syncedAt)
+        assertNull(f.repo.session(id)!!.syncedAt)
     }
 
     @Test
@@ -385,16 +427,28 @@ class PipelineExportUploadTest {
     private fun retention() = LocalRetentionManager(f.repo, { true }, { 7 }, { true }, { f.now }, isActivelyRecording = { false })
 
     @Test
-    fun aSyncedRecordingIsKeptWhileItsExportIsStillToBeMade() = runBlocking {
+    fun aRecordingWhoseExportIsStillToBeMadeIsNeverSyncedSoNeverDeleted() = runBlocking {
+        rotation = null
+        val dir = filedRecording()
+        f.repo.markSessionCreated(id)
+        processor.runQueue()
+        assertNull(f.repo.session(id)!!.syncedAt)
+
+        assertEquals(RetentionBlock.NOT_SYNCED, retention().blockedReason(f.repo.session(id)!!))
+        assertTrue(retention().cleanup().deletedSessions.isEmpty())
+        assertTrue(dir.isDirectory)
+    }
+
+    @Test
+    fun aSyncedRecordingWhoseExportWasNeverMadeIsStillKeptByRetention() = runBlocking {
+        // Only reachable for a recording synced before the export held up SYNCED; retention keeps its guard.
         rotation = null
         filedRecording()
         f.repo.markSessionCreated(id)
         processor.runQueue()
-        assertNotNull(f.repo.session(id)!!.syncedAt)
-        f.repo.recordPublish(id, PublishState.DONE, 0, null) // published raw-only, as the backend does before an export exists
+        f.dao.updateSession(f.repo.session(id)!!.copy(syncedAt = f.now, publishState = PublishState.UNSUPPORTED))
 
         assertEquals(RetentionBlock.EXPORT_PENDING, retention().blockedReason(f.repo.session(id)!!))
-        assertTrue(retention().cleanup().deletedSessions.isEmpty())
     }
 
     @Test
@@ -402,14 +456,13 @@ class PipelineExportUploadTest {
         filedRecording()
         f.repo.markSessionCreated(id)
         stage.runPending()
-        // Raw files verified and synced, export not yet uploaded.
-        f.repo.uploadsForSession(id).filter { it.required }.forEach {
+        // Everything but the export verified, and (as only an older app version could) marked synced.
+        f.repo.uploadsForSession(id).filter { it.kind != UploadSourceKind.EXPORT }.forEach {
             f.repo.markPreparing(it.id); f.repo.markUploading(it.id); f.repo.markUploaded(it.id); f.repo.markVerified(it.id)
         }
         f.repo.markSessionSynced(id)
-        f.repo.recordPublish(id, PublishState.DONE, 1, null)
-        // The frames are covered by the verified chunk, so only the export is holding it.
-        assertEquals(RetentionBlock.EXPORT_NOT_UPLOADED, retention().blockedReason(f.repo.session(id)!!))
+        f.repo.recordPublish(id, PublishState.UNSUPPORTED, 0, null)
+        assertEquals(RetentionBlock.FILES_NOT_VERIFIED, retention().blockedReason(f.repo.session(id)!!))
 
         processor.runQueue()
 
@@ -417,15 +470,28 @@ class PipelineExportUploadTest {
     }
 
     @Test
-    fun aRecordingWithNoPossibleExportIsNotHeldBackByIt() = runBlocking {
-        exporterBehavior = { throw PipelineExporter.ExportException("off", PipelineExporter.Reason.OFF_PROTOCOL) }
-        filedRecording()
+    fun aRecordingIsDeletableRightAfterSyncedAndItsExportIsVerified() = runBlocking {
+        filedRecording(rawRequired = false)
         f.repo.markSessionCreated(id)
 
         processor.runQueue()
-        f.repo.recordPublish(id, PublishState.DONE, 0, null) // nothing to publish, and the backend says so
 
+        assertNotNull(f.repo.session(id)!!.syncedAt)
+        assertEquals(PublishState.UNSUPPORTED, f.repo.session(id)!!.publishState) // no publish step to wait for
         assertNull(retention().blockedReason(f.repo.session(id)!!))
+    }
+
+    @Test
+    fun aRecordingWithNoPossibleExportIsNeverDeletableEither() = runBlocking {
+        exporterBehavior = { throw PipelineExporter.ExportException("off", PipelineExporter.Reason.OFF_PROTOCOL) }
+        val dir = filedRecording()
+        f.repo.markSessionCreated(id)
+
+        processor.runQueue()
+
+        assertEquals(RetentionBlock.NOT_SYNCED, retention().blockedReason(f.repo.session(id)!!))
+        assertTrue(retention().cleanup().deletedSessions.isEmpty())
+        assertTrue(dir.isDirectory) // the only copy stays on the phone
     }
 
     // ---- the plan ------------------------------------------------------------------------------

@@ -20,4 +20,11 @@
     <string name="delete_all_synced">Delete all synced</string>
     <string name="auth_show_password">Show password</string>
     <string name="retry">Retry</string>
+    <string name="auth_terms_explain">Your recordings are uploaded to the DataCollect marketplace, and the video frames can show your home and the people in it. Only record where everyone in view is fine with that.</string>
+    <string name="auth_terms_accept">I accept the Terms and Privacy Policy</string>
+    <string name="auth_read_terms">Read the Terms</string>
+    <string name="auth_read_privacy">Read the Privacy Policy</string>
+    <string name="auth_forgot_password">Forgot password?</string>
+    <string name="my_campaigns">My campaigns</string>
+    <string name="change">Change</string>
 </resources>

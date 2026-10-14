@@ -7,6 +7,7 @@ import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -70,31 +71,149 @@ class CloudApiClientTest {
         assertEquals(0, session.publishedSets)
     }
 
-    @Test
-    fun listPipesGetsTheV1PipesPathAndReadsTheList() = runBlocking {
-        server.enqueue(json("""{"pipes":[{"id":"white","label":"White pipes","color":"#f8fafc","order":1},{"id":"pink","label":"Pink Pipes","color":null,"order":4}]}"""))
+    private val campaignJson = """{"id":"5f0c1a52-3c1e-4e0a-9d6f-0a1b2c3d4e5f","title":"Kitchen tidy","description":"d","instructions":"Record the whole task.","referenceInfo":null,
+        "currency":"INR","rewardPerRecording":5000,"rewardPoints":10,"rules":{"minDuration":5,"maxDuration":600,"orientation":"PORTRAIT"},"collectRaw":false,
+        "target":50,"remaining":38,"endDate":"2026-11-30T00:00:00.000Z","enrolled":true,"enrolledAt":"2026-10-01T09:00:00.000Z","acceptingUploads":true,"status":"ACTIVE",
+        "progress":{"recorded":12,"inReview":2,"approved":9,"rejected":1,"notCounted":0,"earned":45000}}"""
 
-        val pipes = client().listPipes()
+    @Test
+    fun listCampaignsReadsTheMarketplaceEnvelopeOfMyCampaigns() = runBlocking {
+        server.enqueue(json("""{"ok":true,"data":[$campaignJson]}"""))
+
+        val campaigns = client().listCampaigns()
 
         val request = server.takeRequest()
         assertEquals("GET", request.method)
-        assertEquals("/v1/pipes", request.path)
+        assertEquals("/v1/me/campaigns", request.path)
         assertEquals("install-123", request.getHeader("X-Device-Id"))
-        assertEquals(listOf("white", "pink"), pipes.map { it.id })
-        assertEquals("#f8fafc", pipes[0].color)
-        assertNull(pipes[1].color)
-        assertEquals(4, pipes[1].order)
+        val c = campaigns.single()
+        assertEquals("5f0c1a52-3c1e-4e0a-9d6f-0a1b2c3d4e5f", c.id)
+        assertEquals("Kitchen tidy", c.title)
+        assertEquals(5000L, c.rewardPerRecording)
+        assertFalse(c.collectRaw)
+        assertEquals(38, c.remaining)
+        assertEquals("2026-11-30T00:00:00.000Z", c.endDate)
+        assertEquals(12, c.progress.recorded)
+        assertEquals(9, c.progress.approved)
+        assertEquals(45000L, c.progress.earned)
+        assertTrue(c.canRecord)
     }
 
     @Test
-    fun createSessionSendsThePipeWhenChosenAndOmitsItOtherwise() = runBlocking {
-        repeat(2) { server.enqueue(json("""{"session":$sessionJson,"created":true}""")) }
+    fun anEmptyCampaignListIsARealAnswer() = runBlocking {
+        server.enqueue(json("""{"ok":true,"data":[]}"""))
 
-        client().createSession(CreateSessionRequest("s1", "d", "2026-01-01T00:00:00Z", "complete", "0.3.0", pipe = "black"))
-        client().createSession(CreateSessionRequest("s1", "d", "2026-01-01T00:00:00Z", "complete", "0.3.0"))
+        assertTrue(client().listCampaigns().isEmpty())
+    }
 
-        assertEquals("black", JSONObject(server.takeRequest().body.readUtf8()).getString("pipe"))
-        assertFalse(JSONObject(server.takeRequest().body.readUtf8()).has("pipe"))
+    @Test
+    fun aBodyWithoutTheEnvelopeIsAMalformedResponse() {
+        server.enqueue(json("""[{"id":"x"}]"""))
+        server.enqueue(json("""{"ok":false,"data":[]}"""))
+
+        repeat(2) {
+            val error = assertThrows(CloudHttpException::class.java) { runBlocking { client().listCampaigns() } }
+            assertEquals("MALFORMED_RESPONSE", error.code)
+        }
+    }
+
+    @Test
+    fun aStoppedOrFullCampaignCannotBeRecordedFor() = runBlocking {
+        server.enqueue(json("""{"ok":true,"data":[${campaignJson.replace("\"remaining\":38", "\"remaining\":0")},${campaignJson.replace("\"status\":\"ACTIVE\"", "\"status\":\"PAUSED\"")}]}"""))
+
+        val campaigns = client().listCampaigns()
+
+        assertFalse(campaigns[0].canRecord)
+        assertFalse(campaigns[1].canRecord)
+    }
+
+    @Test
+    fun createSessionSendsTheCampaignTheDeviceFingerprintAndTheTake() = runBlocking {
+        server.enqueue(json("""{"session":$sessionJson,"created":true,"requirements":{"rawRequired":false}}"""))
+        val take = TakeInfo("good", listOf("3 frame(s) without tracking, short enough to be filled in."), 152.3, 0, 2)
+
+        val response = client().createSession(
+            CreateSessionRequest("s1", "d", "2026-01-01T00:00:00Z", "complete", "0.4.0", campaignId = "c-1", deviceFingerprint = "samsung/SM-G781B", take = take),
+        )
+
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        assertEquals("c-1", body.getString("campaignId"))
+        assertFalse(body.has("pipe")) // replaced by campaignId
+        assertEquals("samsung/SM-G781B", body.getString("deviceFingerprint"))
+        assertEquals("0.4.0", body.getString("appVersion"))
+        val sent = body.getJSONObject("take")
+        assertEquals("good", sent.getString("verdict"))
+        assertEquals("3 frame(s) without tracking, short enough to be filled in.", sent.getJSONArray("reasons").getString(0))
+        assertEquals(152.3, sent.getDouble("durationSeconds"), 0.0)
+        assertEquals(0, sent.getInt("poseJumps"))
+        assertEquals(2, sent.getInt("longestTrackingLossFrames"))
+        assertEquals(false, response.rawRequired)
+    }
+
+    @Test
+    fun createSessionOmitsWhatItDoesNotKnowAndReadsNoRequirementsAsNull() = runBlocking {
+        server.enqueue(json("""{"session":$sessionJson,"created":true}"""))
+
+        val response = client().createSession(CreateSessionRequest("s1", "d", "2026-01-01T00:00:00Z", "complete", "0.3.0"))
+
+        val body = JSONObject(server.takeRequest().body.readUtf8())
+        assertFalse(body.has("campaignId") || body.has("deviceFingerprint") || body.has("take"))
+        assertNull(response.rawRequired)
+    }
+
+    @Test
+    fun theCompleteAnswerCarriesWhatTheMarketplaceMadeOfTheRecording() = runBlocking {
+        server.enqueue(json("""{"session":${sessionJson.dropLast(1)},"marketplace":{"status":"NOT_COUNTED","reason":"CAMPAIGN_FULL","submissionId":null}}}"""))
+        server.enqueue(json("""{"session":${sessionJson.dropLast(1)},"marketplace":{"status":"CHECKING","reason":null,"submissionId":"sub-1"}}}"""))
+        val api = client()
+
+        val full = api.completeSession("s1", "complete", listOf(SessionFileRef("manifest.json", 1)))
+        val checking = api.completeSession("s1", "complete", listOf(SessionFileRef("manifest.json", 1)))
+
+        assertEquals(MarketplaceInfo("NOT_COUNTED", "CAMPAIGN_FULL", null), full.marketplace)
+        assertTrue(full.marketplace!!.notCounted)
+        assertEquals(MarketplaceInfo("CHECKING", null, "sub-1"), checking.marketplace)
+        assertNull(checking.publishStatus) // the marketplace does not report publishing
+    }
+
+    @Test
+    fun theCampaignRefusalsArePermanentWithPlainWords() = runBlocking {
+        server.enqueue(json("""{"error":{"code":"NOT_ENROLLED","message":"x"}}""", 403))
+        server.enqueue(json("""{"error":{"code":"CAMPAIGN_NOT_FOUND","message":"x"}}""", 404))
+        server.enqueue(json("""{"error":{"code":"CAMPAIGN_CLOSED","message":"x"}}""", 409))
+        server.enqueue(json("""{"error":{"code":"TAKE_NOT_ELIGIBLE","message":"x"}}""", 409))
+        server.enqueue(json("""{"ok":false,"error":{"code":"FORBIDDEN","message":"nope"}}""", 403))
+        val api = client()
+
+        for (code in listOf("NOT_ENROLLED", "CAMPAIGN_NOT_FOUND", "CAMPAIGN_CLOSED", "TAKE_NOT_ELIGIBLE")) {
+            val error = assertThrows(CloudHttpException::class.java) {
+                runBlocking { api.createSession(CreateSessionRequest("s1", "d", "t", "complete", null, campaignId = "c")) }
+            }
+            assertEquals(code, error.code)
+            assertFalse("$code must not be retried", error.retryable)
+            assertNotEquals("x", error.userMessage) // plain words, not the server's terse text
+        }
+        // A 403 the app does not know stays what it was.
+        val other = assertThrows(CloudHttpException::class.java) { runBlocking { api.getSession("s1") } }
+        assertTrue(other.retryable)
+    }
+
+    @Test
+    fun anExpiredTokenIsRefreshedOnceForTheUploadCallsAndTheCallRetriedOnce() = runBlocking {
+        server.enqueue(json("""{"error":{"code":"UNAUTHENTICATED","message":"expired"}}""", 401))
+        server.enqueue(json("""{"session":$sessionJson,"created":false}"""))
+        var token = "old"
+        var refreshes = 0
+        val auth = object : AuthProvider {
+            override suspend fun getToken() = token
+            override suspend fun refreshAfterUnauthorized(rejectedToken: String?): Boolean { refreshes++; token = "new"; return true }
+        }
+
+        client(auth).createSession(CreateSessionRequest("s1", "d", "t", "complete", null))
+
+        assertEquals("Bearer old", server.takeRequest().getHeader("Authorization"))
+        assertEquals("Bearer new", server.takeRequest().getHeader("Authorization"))
+        assertEquals(1, refreshes)
     }
 
     @Test

@@ -12,7 +12,7 @@
         android:textSize="15sp"
         android:textStyle="bold" />
 
-    <!-- Narrows the list to a pipe, or to what is not live yet. Hidden when a day has fewer than two recordings. -->
+    <!-- Narrows the list to a campaign. Hidden when a day has fewer than two recordings. -->
     <HorizontalScrollView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -53,4 +53,13 @@
         android:text="Nothing uploaded on this day."
         android:textSize="14sp"
         android:visibility="gone" />
+
+    <Button
+        android:id="@+id/dayWeb"
+        style="?android:attr/buttonBarButtonStyle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="See progress and earnings on the web"
+        android:textAllCaps="false"
+        android:textColor="#00796B" />
 </LinearLayout>

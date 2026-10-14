@@ -11,6 +11,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 /** Recording only reports two facts (started, finalized); the coordinator turns them into queue rows off-thread. */
 class UploadCoordinatorTest {
@@ -77,6 +78,8 @@ class UploadCoordinatorTest {
     @Test
     fun aSessionWithNoFramesFolderStillFinalizesWithItsPlainFiles() = runBlocking {
         val dir = f.sessionDir(id)
+        File(dir, "device.json").delete()
+        coordinator.onSessionStarted(id, dir)
 
         coordinator.onSessionFinalized(id, dir, "complete")
         until { f.repo.session(id)?.recordingFinal == true }

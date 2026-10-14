@@ -14,7 +14,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  */
 @Database(
     entities = [UploadEntity::class, CloudSessionEntity::class],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 abstract class UploadDatabase : RoomDatabase() {
@@ -47,12 +47,33 @@ abstract class UploadDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Version 4 (marketplace): the account a recording uploads to, whether its raw data is uploaded, and what the
+         * marketplace made of it. Only columns are added. Two data fixes ride along, both for rows that did not finish with
+         * the old backend: a recording that was filed under a LabelNow pipe (white / black / black-white) names no campaign
+         * and is not created in the cloud (so it shows "Choose a campaign to upload"), and the new backend never reports
+         * publishing, so no recording waits for it. Recordings already SYNCED stay synced.
+         */
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE cloud_sessions ADD COLUMN accountId TEXT")
+                db.execSQL("ALTER TABLE cloud_sessions ADD COLUMN rawRequired INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE cloud_sessions ADD COLUMN marketplaceStatus TEXT")
+                db.execSQL("ALTER TABLE cloud_sessions ADD COLUMN marketplaceReason TEXT")
+                db.execSQL(
+                    "UPDATE cloud_sessions SET pipe = NULL, cloudCreated = 0, permanentFailure = 0, lastError = NULL " +
+                        "WHERE syncedAt IS NULL",
+                )
+                db.execSQL("UPDATE cloud_sessions SET publishState = 'UNSUPPORTED'")
+            }
+        }
+
         @Volatile
         private var instance: UploadDatabase? = null
 
         fun get(context: Context): UploadDatabase = instance ?: synchronized(this) {
             instance ?: Room.databaseBuilder(context.applicationContext, UploadDatabase::class.java, NAME)
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                 .build()
                 .also { instance = it }
         }

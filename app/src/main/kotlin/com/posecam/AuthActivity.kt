@@ -11,6 +11,7 @@ import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.view.inputmethod.EditorInfo
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -25,9 +26,10 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 /**
- * Email and password sign-in / sign-up. Recording never needs it; uploading does, because every recording is filed under
- * the collector's account (and counted in their history). It is shown once when the app is first used, and again from
- * Recordings whenever the backend stops accepting the token.
+ * Email and password sign-in / sign-up with the DataCollect marketplace account: the same email and password work on the
+ * website. Recording never needs it; uploading does, because every recording is filed under the collector's account (and
+ * paid to it). It is shown once when the app is first used, and again from Recordings whenever the login is over (the
+ * refresh token was refused). Sign-up asks for the Terms and Privacy Policy to be accepted and sends the terms version.
  *
  * With [EXTRA_REQUIRED] (first launch) Back leaves the app instead of returning to a recorder nobody is signed in to.
  */
@@ -45,6 +47,9 @@ class AuthActivity : Activity() {
     private lateinit var toggle: Button
     private lateinit var progress: ProgressBar
     private lateinit var scroll: ScrollView
+    private lateinit var termsBox: View
+    private lateinit var termsCheck: CheckBox
+    private lateinit var forgot: Button
     private var lastViewportHeight = -1
     private var tapOutsideFields = false
     private var tapStartX = 0f
@@ -68,6 +73,9 @@ class AuthActivity : Activity() {
         toggle = findViewById(R.id.authToggle)
         progress = findViewById(R.id.authProgress)
         scroll = findViewById(R.id.authScroll)
+        termsBox = findViewById(R.id.authTerms)
+        termsCheck = findViewById(R.id.authTermsCheck)
+        forgot = findViewById(R.id.authForgot)
 
         val sync = CloudSync.get(this)
         if (!sync.config.enabled) {
@@ -76,6 +84,12 @@ class AuthActivity : Activity() {
         }
         signingUp = savedInstanceState?.getBoolean(STATE_SIGNING_UP) ?: false
         if (savedInstanceState == null) email.setText(sync.auth.current().lastEmail.orEmpty())
+
+        findViewById<Button>(R.id.authReadTerms).setOnClickListener { openWebLink(sync.meta.current().termsUrl) }
+        findViewById<Button>(R.id.authReadPrivacy).setOnClickListener { openWebLink(sync.meta.current().privacyUrl) }
+        forgot.setOnClickListener { openWebLink(sync.meta.current().passwordResetUrl) }
+        // The links and the terms version come from the backend: fetch them now, so they are ready (and cached) by submit.
+        scope.launch { runCatching { sync.refreshMeta() } }
 
         keepFocusedFieldVisible()
         addShowPasswordToggle(password)
@@ -199,12 +213,14 @@ class AuthActivity : Activity() {
     private fun render() {
         title.text = if (signingUp) "Create your account" else "Sign in"
         subtitle.text = if (signingUp) {
-            "Your uploaded recordings are filed under your account, and the app counts them for you."
+            "One account for this app and the DataCollect website: your recordings are counted and paid to it."
         } else {
-            "Sign in to upload your recordings. You can keep recording without a connection."
+            "Use your DataCollect account (the same email and password as on the website) to upload your recordings. You can keep recording without a connection."
         }
         name.visibility = if (signingUp) View.VISIBLE else View.GONE
         confirm.visibility = if (signingUp) View.VISIBLE else View.GONE
+        termsBox.visibility = if (signingUp) View.VISIBLE else View.GONE
+        forgot.visibility = if (signingUp) View.GONE else View.VISIBLE
         // "Next" on the last visible field would not submit; make the keyboard action match the form.
         password.imeOptions = if (signingUp) EditorInfo.IME_ACTION_NEXT else EditorInfo.IME_ACTION_DONE
         submit.text = if (signingUp) "Create account" else "Sign in"
@@ -225,7 +241,8 @@ class AuthActivity : Activity() {
         val address = AuthValidation.normalizeEmail(email.text.toString())
         val secret = password.text.toString()
         val displayName = name.text.toString().trim()
-        AuthValidation.problem(address, secret, if (signingUp) confirm.text.toString() else null, if (signingUp) displayName else null)?.let {
+        val accepted = termsCheck.isChecked
+        AuthValidation.problem(address, secret, if (signingUp) confirm.text.toString() else null, if (signingUp) displayName else null, accepted)?.let {
             showError(it)
             return
         }
@@ -234,7 +251,14 @@ class AuthActivity : Activity() {
         val sync = CloudSync.get(this)
         scope.launch {
             try {
-                val session = if (signingUp) sync.accounts.register(address, secret, displayName) else sync.accounts.login(address, secret)
+                val session = if (signingUp) {
+                    // The version the collector just accepted: the backend's current one (cached if it can't be reached).
+                    val version = sync.refreshMeta()?.termsVersion ?: sync.meta.current().termsVersion
+                        ?: throw com.posecam.core.cloud.CloudNetworkException(java.io.IOException("terms version unavailable"))
+                    sync.accounts.register(address, secret, displayName, version)
+                } else {
+                    sync.accounts.login(address, secret)
+                }
                 sync.onSignedIn(session)
                 finish()
             } catch (cancel: kotlinx.coroutines.CancellationException) {

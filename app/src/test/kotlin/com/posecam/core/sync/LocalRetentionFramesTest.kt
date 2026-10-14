@@ -23,9 +23,9 @@ class LocalRetentionFramesTest {
     /** Queued, uploaded (by hand), verified and SYNCED: the state the backend confirmed. */
     private suspend fun synced(frameCount: Int, status: String = "complete"): File {
         val dir = f.sessionDir(id, status = status)
-        listOf("poses.csv", "intrinsics.json").forEach { f.file(dir, it, "data-$it") }
+        listOf("poses.csv", "intrinsics.json", "device.json").forEach { f.file(dir, it, "data-$it") }
         f.frames(dir, frameCount)
-        f.repo.finalizeSession(id, dir, status, UploadPlan.forSession(id, dir, f.staging))
+        f.repo.finalizeSession(id, dir, status, UploadPlan.forSession(id, dir, f.staging, includeRaw = true))
         f.repo.markSessionCreated(id)
         f.repo.uploadsForSession(id).forEach {
             f.repo.markPreparing(it.id); f.repo.markUploading(it.id); f.repo.markUploaded(it.id); f.repo.markVerified(it.id)
@@ -74,7 +74,7 @@ class LocalRetentionFramesTest {
         val dir = f.sessionDir(id)
         f.frames(dir, 50)
         File(dir, "frames").listFiles()!!.first { it.name.startsWith("000007_") }.delete()
-        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging))
+        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging, includeRaw = true))
         f.repo.markSessionCreated(id)
         f.repo.uploadsForSession(id).forEach {
             f.repo.markPreparing(it.id); f.repo.markUploading(it.id); f.repo.markUploaded(it.id); f.repo.markVerified(it.id)
@@ -99,7 +99,7 @@ class LocalRetentionFramesTest {
     fun aSessionThatIsNotSyncedIsNeverTouchedWhateverTheStoragePressure() = runBlocking {
         val dir = f.sessionDir(id)
         f.frames(dir, 30)
-        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging))
+        f.repo.finalizeSession(id, dir, "complete", UploadPlan.forSession(id, dir, f.staging, includeRaw = true))
         f.repo.markSessionCreated(id)
         f.now += TimeUnit.DAYS.toMillis(30)
 

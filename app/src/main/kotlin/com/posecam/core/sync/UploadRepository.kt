@@ -2,6 +2,7 @@ package com.posecam.core.sync
 
 import androidx.room.withTransaction
 import com.posecam.core.cloud.CloudLog
+import com.posecam.core.cloud.CloudSessionView
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -34,8 +35,19 @@ class UploadRepository(
 ) {
     // ---- enqueue ---------------------------------------------------------------------------
 
-    suspend fun registerSession(sessionId: String, directory: File) {
-        dao.insertSessionIgnore(newSession(sessionId, directory))
+    /**
+     * A take started. It belongs to the account that is signed in (or was, last: a recording made while signed out is still
+     * its collector's) and is for the campaign that was active when it started; both are fixed here, before anything else
+     * can touch the row. [rawRequired] is that campaign's `collectRaw` at this moment.
+     */
+    suspend fun registerSession(
+        sessionId: String,
+        directory: File,
+        campaignId: String? = null,
+        rawRequired: Boolean = true,
+        accountId: String? = null,
+    ) {
+        dao.insertSessionIgnore(newSession(sessionId, directory).copy(pipe = campaignId, rawRequired = rawRequired, accountId = accountId))
     }
 
     /** Queues one closed file of [sessionId]. Calling it again for the same file is a no-op. */
@@ -50,6 +62,7 @@ class UploadRepository(
         require(CloudFileRules.isUploadable(file.relativePath)) { "Not an uploadable session file: ${file.relativePath}" }
         val now = clock()
         dao.insertSessionIgnore(newSession(sessionId, directory))
+        val rawRequired = dao.getSession(sessionId)?.rawRequired ?: true
         val row = UploadEntity(
             sessionId = sessionId,
             relativePath = file.relativePath,
@@ -57,7 +70,7 @@ class UploadRepository(
             fileType = requireNotNull(CloudFileRules.classify(file.relativePath)),
             kind = file.kind,
             itemCount = file.itemCount,
-            required = CloudFileRules.isRequired(file.relativePath),
+            required = CloudFileRules.isRequired(file.relativePath, rawRequired),
             sizeBytes = file.sizeBytes,
             sha256 = file.sha256,
             createdAt = createdAt ?: now,
@@ -92,15 +105,31 @@ class UploadRepository(
         directory: File,
         recordingStatus: String,
         files: List<QueuedFile>,
+        /**
+         * False for a redo take or an incomplete recording: it is never uploaded, so it keeps no campaign (one it was
+         * started with is dropped) and nothing is queued for it. Only possible before the session exists in the cloud.
+         */
+        eligible: Boolean = true,
     ) {
         transactor.run {
             dao.insertSessionIgnore(newSession(sessionId, directory))
             files.forEach { enqueue(sessionId, directory, it) }
             val session = requireNotNull(dao.getSession(sessionId))
-            if (!session.recordingFinal || session.recordingStatus != recordingStatus) {
-                dao.updateSession(session.copy(recordingFinal = true, recordingStatus = recordingStatus, updatedAt = clock()))
+            val dropCampaign = !eligible && !session.cloudCreated && session.pipe != null
+            if (!session.recordingFinal || session.recordingStatus != recordingStatus || dropCampaign) {
+                dao.updateSession(
+                    session.copy(
+                        recordingFinal = true, recordingStatus = recordingStatus, updatedAt = clock(),
+                        pipe = if (dropCampaign) null else session.pipe,
+                    ),
+                )
             }
         }
+    }
+
+    /** Queues more closed files of a finalized session (idempotent, like [enqueue]). */
+    suspend fun addFiles(sessionId: String, directory: File, files: List<QueuedFile>) {
+        transactor.run { files.forEach { enqueue(sessionId, directory, it) } }
     }
 
     /**
@@ -115,20 +144,88 @@ class UploadRepository(
     }
 
     /**
-     * Files [sessionId] under [pipe]. Only possible until the session exists in the cloud: after that its files already
-     * live in a folder, and moving them would mean different copies in two pipes. Returns whether the choice was recorded.
+     * Files [sessionId] under the campaign [campaignId] ([collectRaw]: that campaign's `collectRaw`), for [accountId] when the
+     * row has no account yet. Only possible until the session exists in the cloud: after that its files already live in a
+     * campaign's folder, and moving them would mean different copies in two. Returns whether the choice was recorded.
+     *
+     * Choosing (or changing) the campaign starts the queue of this recording over: what the backend held under another
+     * campaign, or under the old backend, says nothing about this one, so every file is sent again; raw files the campaign
+     * does not collect are dropped from the queue (the caller then queues the ones that are missing).
      */
-    suspend fun setPipe(sessionId: String, pipe: Pipe): Boolean = transactor.run {
+    suspend fun assignCampaign(sessionId: String, campaignId: String, collectRaw: Boolean, accountId: String?): Boolean = transactor.run {
         val session = dao.getSession(sessionId) ?: return@run false
-        if (session.cloudCreated) return@run session.pipe == pipe.wire
-        dao.updateSession(session.copy(pipe = pipe.wire, updatedAt = clock()))
-        CloudLog.i("pipe_chosen", "session" to sessionId, "pipe" to pipe.wire)
+        if (session.cloudCreated) return@run session.pipe == campaignId
+        if (accountId != null && session.accountId != null && session.accountId != accountId) return@run false
+        val owner = session.accountId ?: accountId
+        if (session.pipe == campaignId && session.rawRequired == collectRaw) {
+            if (owner != session.accountId) dao.updateSession(session.copy(accountId = owner, updatedAt = clock()))
+            return@run true
+        }
+        resetQueueFor(sessionId, collectRaw)
+        // A new campaign is a new chance: a refusal for the old one (not enrolled, closed, gone) no longer applies.
+        dao.updateSession(
+            session.copy(
+                pipe = campaignId, rawRequired = collectRaw, accountId = owner, permanentFailure = false, lastError = null,
+                updatedAt = clock(),
+            ),
+        )
+        CloudLog.i("campaign_chosen", "session" to sessionId, "campaign" to campaignId, "raw" to collectRaw)
         true
     }
 
+    /**
+     * The backend said it wants (or does not want) the raw data, against what the cached campaign said. Only changes
+     * what is *expected*: the caller queues the missing raw files. Rows of raw files are dropped when no longer wanted.
+     */
+    suspend fun setRawRequired(sessionId: String, rawRequired: Boolean) {
+        transactor.run {
+            val session = dao.getSession(sessionId) ?: return@run
+            if (session.rawRequired == rawRequired) return@run
+            dao.uploadsForSession(sessionId).forEach { row ->
+                val required = CloudFileRules.isRequired(row.relativePath, rawRequired)
+                if (row.kind != UploadSourceKind.EXPORT && !required) {
+                    dao.deleteUpload(row.id)
+                    if (row.kind == UploadSourceKind.FRAME_CHUNK) runCatching { File(row.localPath).delete() }
+                } else if (row.required != required) {
+                    dao.updateUpload(row.copy(required = required, updatedAt = clock()))
+                }
+            }
+            dao.updateSession(session.copy(rawRequired = rawRequired, syncedAt = null, updatedAt = clock()))
+            CloudLog.i("raw_required_changed", "session" to sessionId, "raw" to rawRequired)
+        }
+    }
+
+    private suspend fun resetQueueFor(sessionId: String, collectRaw: Boolean) {
+        dao.uploadsForSession(sessionId).forEach { row ->
+            val required = CloudFileRules.isRequired(row.relativePath, collectRaw)
+            if (row.kind != UploadSourceKind.EXPORT && !required) {
+                dao.deleteUpload(row.id)
+                if (row.kind == UploadSourceKind.FRAME_CHUNK) runCatching { File(row.localPath).delete() }
+            } else {
+                dao.updateUpload(
+                    row.copy(
+                        required = required,
+                        state = UploadState.PENDING,
+                        multipartUploadId = null,
+                        multipartState = null,
+                        uploadedBytes = 0,
+                        verifyFailures = 0,
+                        verifiedAt = null,
+                        uploadedAt = null,
+                        lastError = null,
+                        updatedAt = clock(),
+                    ),
+                )
+            }
+        }
+    }
+
+    /** [accountId] signed in: the rows from before accounts were tracked become theirs. Returns how many. */
+    suspend fun adoptUnowned(accountId: String): Int = dao.adoptUnowned(accountId)
+
     // ---- pipeline export -------------------------------------------------------------------
 
-    suspend fun sessionsNeedingExport(): List<CloudSessionEntity> = dao.sessionsNeedingExport()
+    suspend fun sessionsNeedingExport(accountId: String? = null): List<CloudSessionEntity> = dao.sessionsNeedingExport(accountId)
 
     /**
      * The export of [sessionId] was written to staging: queue its files and remember it is done, in one transaction, so a
@@ -182,7 +279,8 @@ class UploadRepository(
 
     // ---- queue access ----------------------------------------------------------------------
 
-    suspend fun runnable(): List<UploadEntity> = dao.runnableUploads()
+    /** What [accountId] can upload now. Another account's files are never in it. */
+    suspend fun runnable(accountId: String): List<UploadEntity> = dao.runnableUploads(accountId)
 
     suspend fun get(id: Long): UploadEntity? = dao.getUpload(id)
 
@@ -288,24 +386,28 @@ class UploadRepository(
         }
     }
 
-    /** User action: put permanently failed files (of one session, or all) back in the queue. */
-    suspend fun retryFailed(sessionId: String? = null): Int = transactor.run {
-        val failed = dao.failedUploads(sessionId)
+    /**
+     * User action: put permanently failed files (of one session, or all) back in the queue. With [accountId] only that
+     * account's recordings are touched: another account's rows stay exactly as they are.
+     */
+    suspend fun retryFailed(sessionId: String? = null, accountId: String? = null): Int = transactor.run {
+        val mine = dao.allSessions().filter { accountId == null || it.accountId == accountId }.map { it.sessionId }.toSet()
+        val failed = dao.failedUploads(sessionId).filter { accountId == null || it.sessionId in mine }
         failed.forEach { resetToPending(it.id, "") }
         // A session the backend refused outright gets another chance as well.
         dao.allSessions()
-            .filter { it.permanentFailure && (sessionId == null || it.sessionId == sessionId) }
+            .filter { it.permanentFailure && it.sessionId in mine && (sessionId == null || it.sessionId == sessionId) }
             .forEach { dao.updateSession(it.copy(permanentFailure = false, lastError = null, updatedAt = clock())) }
         // So does an export that crashed (storage, encoder): only an explicit retry runs it again.
         dao.allSessions()
-            .filter { it.exportState == ExportState.FAILED && (sessionId == null || it.sessionId == sessionId) }
+            .filter { it.exportState == ExportState.FAILED && it.sessionId in mine && (sessionId == null || it.sessionId == sessionId) }
             .forEach { dao.updateSession(it.copy(exportState = ExportState.PENDING, exportNote = null, updatedAt = clock())) }
         failed.size
     }
 
     // ---- sessions --------------------------------------------------------------------------
 
-    suspend fun sessionsNeedingCreation(): List<CloudSessionEntity> = dao.sessionsNeedingCreation()
+    suspend fun sessionsNeedingCreation(accountId: String): List<CloudSessionEntity> = dao.sessionsNeedingCreation(accountId)
 
     suspend fun markSessionCreated(sessionId: String) = mutateSession(sessionId) {
         it.copy(cloudCreated = true, lastError = null)
@@ -322,11 +424,21 @@ class UploadRepository(
         it.copy(lastError = error.take(MAX_ERROR_CHARS))
     }
 
-    suspend fun sessionsReadyToComplete(): List<CloudSessionEntity> = dao.sessionsReadyToComplete()
+    suspend fun sessionsReadyToComplete(accountId: String): List<CloudSessionEntity> = dao.sessionsReadyToComplete(accountId)
 
-    suspend fun markSessionSynced(sessionId: String) = mutateSession(sessionId) {
+    /**
+     * The backend confirmed the session SYNCED. [view] is its answer: `marketplace` says whether the recording was counted
+     * (a NOT_COUNTED one is still synced: the files are kept, so the phone may free its copy). A backend that sends no
+     * `publishStatus` -- the marketplace's, always -- does not report publishing, so nothing waits for it.
+     */
+    suspend fun markSessionSynced(sessionId: String, view: CloudSessionView? = null) = mutateSession(sessionId) {
         // Synced again means the backend may publish again, so an earlier website verdict no longer holds.
-        it.copy(syncedAt = clock(), lastError = null, publishState = PublishState.PENDING, publishedSets = 0, publishNote = null)
+        it.copy(
+            syncedAt = clock(), lastError = null,
+            publishState = if (view != null && view.publishStatus == null) PublishState.UNSUPPORTED else PublishState.PENDING,
+            publishedSets = 0, publishNote = null,
+            marketplaceStatus = view?.marketplace?.status, marketplaceReason = view?.marketplace?.reason,
+        )
     }
 
     /** What the backend last said about this recording reaching the website (see [PublishTracker]). */

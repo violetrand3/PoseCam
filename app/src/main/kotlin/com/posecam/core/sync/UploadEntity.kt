@@ -33,7 +33,7 @@ data class UploadEntity(
     val kind: UploadSourceKind = UploadSourceKind.PLAIN,
     /** JPEGs a frame chunk holds. Retention uses it to prove every local frame is inside a verified chunk. */
     val itemCount: Int = 0,
-    /** False for derived files (pipeline exports) that must not hold up SYNCED. */
+    /** Whether the file holds up SYNCED (see [CloudFileRules.isRequired]); every row the app queues today is required. */
     val required: Boolean = true,
     val sizeBytes: Long,
     /** SHA-256 hex. Null until known (computed by the worker on a background thread). */
@@ -74,8 +74,10 @@ data class CloudSessionEntity(
     val createdAt: Long,
     val updatedAt: Long,
     /**
-     * [Pipe.wire] the collector chose for this recording. Null until they choose: such a session is never created in
-     * the cloud and none of its files are uploaded, because the pipe decides the cloud folder they go to.
+     * The campaign this recording is for (a campaign id; the column keeps its old name, `pipe`, so the migration stays
+     * additive). Null until one is chosen -- the active campaign when the take started, or one picked in Recordings for a
+     * good, complete older recording: such a session is never created in the cloud and none of its files are queued. An
+     * older app version stored white / black / black-white here; those are not campaigns (see [Pipe.isLegacyPipe]).
      */
     val pipe: String? = null,
     /** Pipeline export progress (see [ExportState]). Added in database version 2; existing rows start at PENDING. */
@@ -91,6 +93,23 @@ data class CloudSessionEntity(
     val publishedSets: Int = 0,
     /** The backend's reason when [publishState] is FAILED. */
     val publishNote: String? = null,
+    /**
+     * The marketplace account (`user.id`) this recording uploads to. Uploads only ever run for the rows whose account is
+     * the signed-in one; another account's rows stay in the queue, untouched ("Belongs to another account"). Null for
+     * rows made before this existed: the first account that signs in afterwards adopts them. Added in database version 4.
+     */
+    val accountId: String? = null,
+    /**
+     * Whether this recording's raw data (intrinsics, poses, frame metadata, IMU, frames) is uploaded too: the campaign's
+     * `collectRaw` when the recording was queued. When false, only `manifest.json`, `device.json` and the export are.
+     * Rows from before version 4 uploaded everything, hence the default.
+     */
+    @ColumnInfo(defaultValue = "1")
+    val rawRequired: Boolean = true,
+    /** `session.marketplace.status` of the `complete` answer ("CHECKING", "NOT_COUNTED", ...); null until synced. */
+    val marketplaceStatus: String? = null,
+    /** `session.marketplace.reason` when [marketplaceStatus] is NOT_COUNTED ("CAMPAIGN_FULL", ...). */
+    val marketplaceReason: String? = null,
 )
 
 /**

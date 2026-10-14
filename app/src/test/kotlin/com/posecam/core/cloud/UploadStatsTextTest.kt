@@ -52,53 +52,64 @@ class UploadStatsTextTest {
 
     // ---- the day list and a day's recordings -----------------------------------------------------
 
-    private fun rec(id: String, date: String, pipe: String = "white", label: String = "White pipes", status: String = "live") =
-        UploadedRecording(id, pipe, label, "2026-10-09T10:00:00.000Z", date, status)
+    private fun rec(id: String, date: String, campaign: String = "c-1", title: String = "Kitchen tidy", marketplace: String? = null) =
+        UploadedRecording(id, campaign, title, "2026-10-09T10:00:00.000Z", date, "uploaded", marketplace)
 
-    @Test fun eachDayIsOneRowWithItsPipeSplitBiggestFirst() {
+    @Test fun eachDayIsOneRowWithItsCampaignSplitBiggestFirst() {
         val stats = UploadStats(
             "a@b.co", 190, 100, null,
             listOf(
-                DayCount("2026-10-09", 100, mapOf("black" to 35, "white" to 40, "pink" to 25), live = 94, publishing = 5, failed = 1),
-                DayCount("2026-10-08", 90, mapOf("white" to 90), live = 90),
+                DayCount("2026-10-09", 100, mapOf("c-2" to 35, "c-1" to 40, "c-3" to 25)),
+                DayCount("2026-10-08", 90, mapOf("c-1" to 90)),
             ),
         )
 
-        val rows = UploadStatsText.dayRows(stats, "2026-10-09") { wire -> if (wire == "white") "White pipes" else null }
+        val rows = UploadStatsText.dayRows(stats, "2026-10-09") { id -> if (id == "c-1") "Kitchen tidy" else null }
 
         assertEquals("Today", rows[0].title)
         assertEquals(100, rows[0].count)
-        assertEquals("White 40 \u00b7 black 35 \u00b7 pink 25", rows[0].pipes)
-        assertEquals("5 publishing \u00b7 1 failed", rows[0].attention)
-        assertEquals(true, rows[0].hasFailed)
+        assertEquals("Kitchen tidy 40 \u00b7 c-2 35 \u00b7 c-3 25", rows[0].campaigns)
         assertEquals("Yesterday", rows[1].title)
-        assertEquals("", rows[1].attention) // a fully live day has nothing to flag
-        assertEquals(false, rows[1].hasFailed)
+        assertEquals("Kitchen tidy 90", rows[1].campaigns)
     }
 
-    @Test fun pipeNamesAreShortAndTiesKeepAStableOrder() {
-        assertEquals("White", UploadStatsText.shortPipe("White pipes"))
-        assertEquals("Black/White", UploadStatsText.shortPipe("Black/White pipes"))
-        assertEquals("Pink", UploadStatsText.shortPipe("Pink Pipes"))
-        assertEquals("a 2 \u00b7 b 2", UploadStatsText.pipeSplit(mapOf("b" to 2, "a" to 2)) { null })
+    @Test fun tiesKeepAStableOrder() {
+        assertEquals("a 2 \u00b7 b 2", UploadStatsText.campaignSplit(mapOf("b" to 2, "a" to 2)) { null })
     }
 
-    @Test fun aRecordingShowsItsNameAndPipeAndStatus() {
-        val r = rec("capture-20261009T154304-60c403", "2026-10-09", status = "publishing")
+    @Test fun aRecordingShowsItsNameCampaignAndUploadedStatus() {
+        val r = rec("capture-20261009T154304-60c403", "2026-10-09")
         assertEquals("20261009T154304-60c403", UploadStatsText.recordingName(r.sessionId))
-        assertEquals("White pipe \u00b7 Publishing\u2026", UploadStatsText.recordingDetail(r) { null })
-        assertEquals("Pink pipe \u00b7 Live", UploadStatsText.recordingDetail(rec("c", "d", "pink", "Pink Pipes")) { null })
+        // The phone's own name for the campaign wins; the server's title is the fallback.
+        assertEquals("Kitchen tidy \u00b7 Uploaded", UploadStatsText.recordingDetail(r) { null })
+        assertEquals("Mine \u00b7 Uploaded", UploadStatsText.recordingDetail(r) { "Mine" })
+    }
+
+    @Test fun theMarketplaceStatusIsASmallSecondLineOnlyWhenTheBackendSaysSo() {
+        assertNull(UploadStatsText.reviewLine(rec("a", "d")))
+        assertEquals("In review", UploadStatsText.reviewLine(rec("a", "d", marketplace = "IN_REVIEW")))
+        assertEquals("Approved", UploadStatsText.reviewLine(rec("a", "d", marketplace = "APPROVED")))
+        assertEquals("Checking", UploadStatsText.reviewLine(rec("a", "d", marketplace = "CHECKING")))
+        assertEquals("Rejected", UploadStatsText.reviewLine(rec("a", "d", marketplace = "REJECTED")))
+        assertEquals("Not counted", UploadStatsText.reviewLine(rec("a", "d", marketplace = "NOT_COUNTED")))
+    }
+
+    @Test fun aNotCountedRecordingSaysWhyWhenTheReasonIsKnown() {
+        assertEquals("Not counted: campaign full", UploadStatsText.marketplaceLabel("NOT_COUNTED", "CAMPAIGN_FULL"))
+        assertEquals("Not counted: campaign closed", UploadStatsText.marketplaceLabel("NOT_COUNTED", "CAMPAIGN_CLOSED"))
+        assertEquals("Not counted: duplicate recording", UploadStatsText.marketplaceLabel("NOT_COUNTED", "DUPLICATE"))
+        assertEquals("Rejected: Blurry video", UploadStatsText.marketplaceLabel("REJECTED", "Blurry video"))
+        assertEquals("Something new", UploadStatsText.marketplaceLabel("SOMETHING_NEW", null))
     }
 
     @Test fun theDaySummaryDescribesTheWholeDay() {
-        val day = List(98) { rec("c$it", "d") } + rec("p1", "d", status = "publishing") + rec("f1", "d", status = "publish_failed")
-        assertEquals("100 recordings \u00b7 98 live \u00b7 1 publishing \u00b7 1 failed", UploadStatsText.daySummary(day))
-        assertEquals("1 recording \u00b7 1 live", UploadStatsText.daySummary(listOf(rec("c", "d"))))
+        val day = List(96) { rec("c$it", "d") } + List(2) { rec("r$it", "d", marketplace = "IN_REVIEW") } + List(2) { rec("a$it", "d", marketplace = "APPROVED") }
+        assertEquals("100 recordings \u00b7 2 in review \u00b7 2 approved", UploadStatsText.daySummary(day))
+        assertEquals("1 recording", UploadStatsText.daySummary(listOf(rec("c", "d"))))
     }
 
-    @Test fun everyStatusHasWording() {
-        assertEquals("Live", UploadStatsText.status("live"))
-        assertEquals("Publish failed", UploadStatsText.status("publish_failed"))
-        assertEquals("Uploaded", UploadStatsText.status("something new"))
+    @Test fun everyRecordingReadsUploadedWhatEverTheOldCopySaid() {
+        assertEquals("Uploaded", UploadStatsText.status("uploaded"))
+        assertEquals("Uploaded", UploadStatsText.status("publish_failed")) // an old cached copy
     }
 }

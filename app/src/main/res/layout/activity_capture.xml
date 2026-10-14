@@ -9,16 +9,55 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <TextView
-        android:id="@+id/status"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_gravity="top"
-        android:background="#99000000"
-        android:fontFamily="monospace"
-        android:padding="16dp"
-        android:textColor="#FFFFFF"
-        android:textSize="14sp" />
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#99000000"
+            android:fontFamily="monospace"
+            android:padding="16dp"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp" />
+
+        <!-- The campaign recordings are filed under: chosen BEFORE recording (the phone faces away once mounted). -->
+        <LinearLayout
+            android:id="@+id/campaignBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#B3000000"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="16dp"
+            android:paddingEnd="8dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/campaignName"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/campaignChange"
+                style="?android:attr/buttonBarButtonStyle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/change"
+                android:textAllCaps="false"
+                android:textColor="#80CBC4" />
+        </LinearLayout>
+    </LinearLayout>
 
     <LinearLayout
         android:layout_width="match_parent"

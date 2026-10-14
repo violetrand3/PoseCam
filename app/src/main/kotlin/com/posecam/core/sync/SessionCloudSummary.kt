@@ -13,8 +13,18 @@ data class SessionCloudSummary(
     val totalBytes: Long,
     val transferredBytes: Long,
     val lastError: String?,
-    /** [Pipe.wire] chosen for this recording, or null while it still has to be chosen. */
+    /** The campaign id chosen for this recording, or null while it still has to be chosen. */
     val pipe: String? = null,
+    /** True once the backend knows the session: from then on its campaign can no longer be changed. */
+    val cloudCreated: Boolean = false,
+    /** The marketplace account the recording uploads to; null for rows from before accounts were tracked. */
+    val accountId: String? = null,
+    /** Whether raw data is uploaded too (the campaign's `collectRaw`). */
+    val rawRequired: Boolean = true,
+    /** What the marketplace made of the recording once synced: "CHECKING", "NOT_COUNTED", ...; null until then. */
+    val marketplaceStatus: String? = null,
+    /** "CAMPAIGN_FULL" | "CAMPAIGN_CLOSED" | "DUPLICATE" when [marketplaceStatus] is NOT_COUNTED. */
+    val marketplaceReason: String? = null,
     /** Where the pipeline export stands; null when the session is unknown or exporting does not apply. */
     val exportState: ExportState? = null,
     /** The exporter's reason when [exportState] says the export is missing. */
@@ -33,6 +43,20 @@ data class SessionCloudSummary(
         if (status == SessionCloudStatus.PENDING && waitingForNetwork) SessionCloudStatus.WAITING_FOR_WIFI else status
 
     val isSynced: Boolean get() = status == SessionCloudStatus.SYNCED
+
+    /** Synced, but the marketplace did not count it (campaign full or closed, duplicate): the files are kept, nothing is paid. */
+    val notCounted: Boolean get() = isSynced && marketplaceStatus == "NOT_COUNTED"
+
+    /**
+     * This recording as seen by [currentAccountId]: another account's recording reads [SessionCloudStatus.OTHER_ACCOUNT]
+     * (it is neither uploaded nor counted in the banner). Nobody signed in, or an unowned row, changes nothing.
+     */
+    fun forAccount(currentAccountId: String?): SessionCloudSummary =
+        if (currentAccountId != null && accountId != null && accountId != currentAccountId && status != SessionCloudStatus.SYNCED) {
+            copy(status = SessionCloudStatus.OTHER_ACCOUNT)
+        } else {
+            this
+        }
 
     /**
      * Something about this recording failed for good and only a tap will run it again: a file or the cloud session
@@ -66,9 +90,12 @@ data class SessionCloudSummary(
                 session?.permanentFailure == true || (aggregate?.failedFiles ?: 0) > 0 -> SessionCloudStatus.FAILED
                 // Confirmed by the backend, and nothing has been re-queued since.
                 session?.syncedAt != null && (total == 0 || allVerified) -> SessionCloudStatus.SYNCED
-                // Not chosen yet, and not in the cloud: the collector has to say where it goes before anything is sent.
+                // No campaign yet, and not in the cloud: the collector has to choose one before anything is sent.
                 session != null && session.pipe == null && !session.cloudCreated && session.syncedAt == null ->
-                    SessionCloudStatus.AWAITING_PIPE
+                    SessionCloudStatus.AWAITING_CAMPAIGN
+                // Everything that was queued is in S3, but the export (which holds up SYNCED) is not there: say so.
+                allVerified && session?.recordingFinal == true && session.exportState != ExportState.DONE ->
+                    SessionCloudStatus.EXPORT_BLOCKED
                 // Everything is in S3; only the session-level confirmation is outstanding.
                 allVerified && session?.recordingFinal == true -> SessionCloudStatus.VERIFYING
                 // Verifying means every byte of the recording is in and only the last checks remain. A file being
@@ -91,6 +118,11 @@ data class SessionCloudSummary(
                 transferredBytes = aggregate?.transferredBytes ?: 0,
                 lastError = aggregate?.lastError ?: session?.lastError,
                 pipe = session?.pipe,
+                cloudCreated = session?.cloudCreated ?: false,
+                accountId = session?.accountId,
+                rawRequired = session?.rawRequired ?: true,
+                marketplaceStatus = session?.marketplaceStatus,
+                marketplaceReason = session?.marketplaceReason,
                 exportState = session?.exportState,
                 exportNote = session?.exportNote,
                 exportFiles = export?.files ?: 0,

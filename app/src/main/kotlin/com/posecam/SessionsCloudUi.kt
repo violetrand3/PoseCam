@@ -27,7 +27,9 @@ import com.posecam.core.sync.CloudSyncSettings
 import com.posecam.core.sync.CloudUiText
 import com.posecam.core.sync.ExportState
 import com.posecam.core.sync.MobileDataGuard
-import com.posecam.core.sync.Pipe
+import com.posecam.core.sync.ActiveCampaign
+import com.posecam.core.sync.CampaignUiText
+import com.posecam.core.sync.SessionManifestInfo
 import com.posecam.core.sync.SessionCloudStatus
 import com.posecam.core.sync.SessionCloudSummary
 import com.posecam.core.sync.SyncPolicy
@@ -65,6 +67,13 @@ class SessionsCloudUi(
     private var signedIn = sync.auth.isSignedIn
     private var synced: SyncedOverview? = null
     private var syncedKey: Any? = null
+
+    /** Finished recordings' manifests (their verdict never changes), so scrolling the list does not re-read them. */
+    private val manifests = HashMap<String, SessionManifestInfo>()
+
+    private fun manifestOf(sessionId: String): SessionManifestInfo? =
+        manifests[sessionId] ?: SessionManifestInfo.read(java.io.File(sync.capturesRoot, sessionId))
+            ?.also { if (it.complete) manifests[sessionId] = it }
 
     private val banner: View = activity.findViewById(R.id.cloudBanner)
     private val bannerText: TextView = activity.findViewById(R.id.cloudBannerText)
@@ -109,23 +118,32 @@ class SessionsCloudUi(
     /** The second line of a recording's row. */
     fun rowLine(sessionId: String): String {
         val summary = summaries[sessionId]
-        // The backend's label when it is in the cached list, else the raw id ("white"): never blank for a filed recording.
-        val pipe = summary?.pipe?.let { wire -> Pipe.short(Pipe.fromWire(wire, sync.pipes.current())?.label ?: wire) }
-        return CloudUiText.rowStatus(summary, settings.policy, waitingForNetwork, settings.exportRotationDegrees != null, pipe)
+        // The campaign's title when it is in the cached list; a campaign that is gone from it is simply not named.
+        val title = summary?.pipe?.let { sync.campaigns.title(sync.recordingAccountId(), it) }
+        return CloudUiText.rowStatus(
+            summary, settings.policy, waitingForNetwork, settings.exportRotationDegrees != null, title,
+            notUploadedReason = if (summary?.cloudCreated == true || summary?.isSynced == true) null else manifestOf(sessionId)?.notUploadedReason,
+        )
     }
 
     /** The icon drawn before a recording's row; one per cloud status, so the state reads at a glance. */
     @DrawableRes
-    fun rowIcon(sessionId: String): Int =
-        when (summaries[sessionId]?.displayStatus(waitingForNetwork) ?: SessionCloudStatus.LOCAL_ONLY) {
-            SessionCloudStatus.LOCAL_ONLY -> R.drawable.ic_cloud_local
-            SessionCloudStatus.AWAITING_PIPE -> R.drawable.ic_cloud_choose_pipe
+    fun rowIcon(sessionId: String): Int {
+        val summary = summaries[sessionId]
+        val neverUploaded = summary?.cloudCreated != true && summary?.isSynced != true && manifestOf(sessionId)?.notUploadedReason != null
+        if (neverUploaded) return R.drawable.ic_cloud_local
+        return when (summary?.displayStatus(waitingForNetwork) ?: SessionCloudStatus.LOCAL_ONLY) {
+            SessionCloudStatus.LOCAL_ONLY, SessionCloudStatus.OTHER_ACCOUNT -> R.drawable.ic_cloud_local
+            SessionCloudStatus.AWAITING_CAMPAIGN -> R.drawable.ic_cloud_choose_pipe
             SessionCloudStatus.WAITING_FOR_WIFI, SessionCloudStatus.PENDING -> R.drawable.ic_cloud_queued
             SessionCloudStatus.UPLOADING -> R.drawable.ic_cloud_uploading
             SessionCloudStatus.VERIFYING -> R.drawable.ic_cloud_verifying
             SessionCloudStatus.SYNCED -> R.drawable.ic_cloud_synced
+            SessionCloudStatus.EXPORT_BLOCKED ->
+                if (summary?.exportState == ExportState.PENDING) R.drawable.ic_cloud_queued else R.drawable.ic_cloud_failed
             SessionCloudStatus.FAILED -> R.drawable.ic_cloud_failed
         }
+    }
 
     /** Whether this recording has something that failed and waits for a Retry tap. */
     fun needsRetry(sessionId: String): Boolean = summaries[sessionId]?.needsRetry == true
@@ -185,39 +203,73 @@ class SessionsCloudUi(
     /** Menu entries to put before the existing ones for this recording. */
     fun actionsFor(sessionId: String): List<Action> {
         val summary = summaries[sessionId]
-        val status = (summary?.displayStatus(waitingForNetwork)) ?: com.posecam.core.sync.SessionCloudStatus.LOCAL_ONLY
+        val status = (summary?.displayStatus(waitingForNetwork)) ?: SessionCloudStatus.LOCAL_ONLY
+        val manifest = manifestOf(sessionId)
+        // Redo takes and incomplete recordings are never uploaded: no "upload as ..." for them, only the reason.
+        if (summary?.cloudCreated != true && summary?.isSynced != true && manifest?.notUploadedReason != null) {
+            return listOf(Action("Not uploaded: ${manifest.notUploadedReason}") {})
+        }
         val action = CloudCardAction.forStatus(status, recordingInProgress = false)
-        if (action == CloudCardAction.CHOOSE_PIPE) {
-            // Finished recordings that were never filed (a take to redo, an older recording, a killed take).
-            return sync.pipes.current().map { pipe ->
-                Action(CloudUiText.pipeActionLabel(pipe)) {
-                    sync.coordinator.choosePipe(sessionId, pipe)
-                    Toast.makeText(activity, "Filed under ${pipe.label}", Toast.LENGTH_SHORT).show()
-                    ExportRotationDialog.askOnceIfUnset(activity, sync)
-                }
-            }
+        if (action == CloudCardAction.CHOOSE_CAMPAIGN) {
+            // A good, complete recording that was never filed (an older one, or made before a campaign was active).
+            return listOf(Action(CloudUiText.chooseCampaignLabel(hasCampaign = false)) { chooseCampaign(sessionId) })
+        }
+        // Not in the cloud yet: the campaign can still be changed.
+        val change = if (summary != null && !summary.cloudCreated && !summary.isSynced && summary.pipe != null &&
+            status != SessionCloudStatus.OTHER_ACCOUNT
+        ) {
+            listOf(Action(CloudUiText.chooseCampaignLabel(hasCampaign = true)) { chooseCampaign(sessionId) })
+        } else {
+            emptyList()
         }
         val label = CloudUiText.actionLabel(action)
         if (label != null) {
-            return listOf(
+            return change + listOf(
                 Action(label) {
                     confirmMobileData(summary?.totalBytes ?: 0) {
                         sync.coordinator.syncSession(sessionId, retryFailedFiles = action == CloudCardAction.RETRY)
                         Toast.makeText(activity, "Uploading…", Toast.LENGTH_SHORT).show()
                     }
                 },
-            )
+            ) + exportActions(sessionId, summary)
         }
         val info = CloudCardAction.infoMessage(status, summary, recordingInProgress = false)
-        return (if (info.isEmpty()) emptyList() else listOf(Action("Cloud: $info") {})) + exportActions(sessionId, summary)
+        return change + (if (info.isEmpty()) emptyList() else listOf(Action("Cloud: $info") {})) + exportActions(sessionId, summary)
     }
 
     /**
-     * What a synced recording can still do about its pipeline export: say why there is none (it will never appear in
-     * LabelNow, which a bare "Synced" would hide), or run a crashed export / failed export upload again.
+     * The campaign chooser: the collector's accepted campaigns that still take recordings. With none, it says to accept
+     * one on the website first.
+     */
+    private fun chooseCampaign(sessionId: String) {
+        val options = sync.myCampaigns().filter { it.acceptingUploads && it.remaining > 0 }
+        if (options.isEmpty()) {
+            AlertDialog.Builder(activity)
+                .setTitle(CampaignUiText.EMPTY_TITLE)
+                .setMessage(CampaignUiText.EMPTY_DETAIL)
+                .setPositiveButton(CampaignUiText.OPEN_WEBSITE) { _, _ -> activity.openWebLink(sync.meta.current().webAppUrl) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
+            return
+        }
+        AlertDialog.Builder(activity)
+            .setTitle("Upload to which campaign?")
+            .setItems(options.map { it.title }.toTypedArray()) { _, which ->
+                val campaign = options[which]
+                sync.coordinator.chooseCampaign(sessionId, ActiveCampaign(campaign.id, campaign.title, campaign.collectRaw))
+                Toast.makeText(activity, "Uploading to ${campaign.title}", Toast.LENGTH_SHORT).show()
+                ExportRotationDialog.askOnceIfUnset(activity, sync)
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * What a recording can still do about its pipeline export, which holds up SYNCED: say why there is none (so it is not
+     * uploaded), start a waiting one by hand, or run a crashed export / failed export upload again.
      */
     private fun exportActions(sessionId: String, summary: SessionCloudSummary?): List<Action> {
-        if (summary == null || !summary.isSynced) return emptyList()
+        if (summary == null || !(summary.isSynced || summary.status == SessionCloudStatus.EXPORT_BLOCKED)) return emptyList()
         val actions = mutableListOf<Action>()
         CloudUiText.publishFailedDetail(summary)?.let { detail ->
             actions += Action("Why isn't it on the website?") {
@@ -229,8 +281,8 @@ class SessionsCloudUi(
             actions += Action("Retry publish") { retryPublish(sessionId) }
         }
         CloudUiText.missingExportDetail(summary)?.let { detail ->
-            actions += Action("Why no pipeline export?") {
-                AlertDialog.Builder(activity).setTitle("No pipeline export").setMessage(detail)
+            actions += Action("Why isn't it uploaded?") {
+                AlertDialog.Builder(activity).setTitle("Not uploaded").setMessage(detail)
                     .setPositiveButton(R.string.close, null).show()
             }
         }
@@ -360,7 +412,7 @@ class SessionsCloudUi(
         val overview = synced ?: return
         val count = overview.deletableSessions.size
         val kept = if (overview.keptBack > 0) {
-            "\n\n${overview.keptBack} more stay until they are published."
+            "\n\n${overview.keptBack} more stay until their upload is complete."
         } else {
             ""
         }

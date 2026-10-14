@@ -5,6 +5,7 @@ import com.posecam.core.cloud.CloudException
 import com.posecam.core.cloud.CloudHttpException
 import com.posecam.core.cloud.CloudLog
 import com.posecam.core.cloud.CloudNetworkException
+import com.posecam.core.cloud.CloudSessionView
 import com.posecam.core.cloud.CreateSessionRequest
 import com.posecam.core.cloud.SessionFileRef
 import com.posecam.core.cloud.UploadMode
@@ -25,6 +26,16 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
+/** The phone model facts of `device.json` the backend uses for fraud checks: "manufacturer/model/device/hardware/android<release>". */
+internal object DeviceFingerprint {
+    fun read(directory: File): String? = runCatching {
+        val json = JSONObject(File(directory, "device.json").readText(Charsets.UTF_8))
+        val parts = listOf("manufacturer", "model", "device", "hardware").map { json.optString(it).trim() }.filter { it.isNotEmpty() }
+        val release = json.optString("android_release").trim().takeIf { it.isNotEmpty() }?.let { "android$it" }
+        (parts + listOfNotNull(release)).joinToString("/").takeIf { it.isNotEmpty() }
+    }.getOrNull()
+}
+
 /** Outcome of one pass over the queue, with what changed (for user messaging). */
 data class QueueRunReport(val result: QueueRunResult, val sessionsSynced: Int)
 
@@ -42,7 +53,8 @@ enum class QueueRunResult {
  * sessions. All durable progress lives in Room via [UploadRepository], so this class can be
  * stopped at any instant -- worker cancelled, process killed -- and a later run continues.
  *
- * It knows nothing about WorkManager, recording or authentication.
+ * It knows nothing about WorkManager or recording. Of authentication it knows only whose recordings it may upload
+ * ([AccountScope]): rows of any other account are never touched. Token refresh happens behind [CloudApi].
  */
 class UploadProcessor(
     private val repository: UploadRepository,
@@ -62,6 +74,10 @@ class UploadProcessor(
     private val progressIntervalMs: Long = 1_000,
     /** Makes each filed recording's pipeline export before anything is sent; null leaves exporting off. */
     private val exportStage: PipelineExportStage? = null,
+    /** Whose recordings this processor uploads: the signed-in account's, and nobody's while signed out. */
+    private val account: AccountScope,
+    /** The raw files of a recording, for when the backend turns out to want them although the cached campaign said no. */
+    private val rawPlan: (sessionId: String, directory: File) -> List<QueuedFile> = { _, _ -> emptyList() },
 ) {
     private val multipart = MultipartUploader(api, transport, repository, hasher)
 
@@ -72,9 +88,11 @@ class UploadProcessor(
     }
 
     /** Whether a run could do anything: lets the worker skip starting a foreground service for nothing. */
-    suspend fun hasWork(): Boolean =
-        repository.runnable().isNotEmpty() || repository.sessionsNeedingCreation().isNotEmpty() ||
-            repository.sessionsReadyToComplete().isNotEmpty() || exportStage?.hasWork() == true
+    suspend fun hasWork(): Boolean {
+        val accountId = account.accountId() ?: return false
+        return repository.runnable(accountId).isNotEmpty() || repository.sessionsNeedingCreation(accountId).isNotEmpty() ||
+            repository.sessionsReadyToComplete(accountId).isNotEmpty() || exportStage?.hasWork(accountId) == true
+    }
 
     suspend fun runQueue(onlySessionId: String? = null): QueueRunResult = runQueueReport(onlySessionId).result
 
@@ -97,9 +115,15 @@ class UploadProcessor(
     private var syncedThisRun = 0
 
     private suspend fun drainQueue(onlySessionId: String?): QueueRunResult {
+        // Nobody signed in: nothing is sent, and nothing is touched. Signing in schedules the queue again.
+        val accountId = account.accountId() ?: return QueueRunResult.DONE
+        // A token that is about to run out is replaced now, so a long pass does not start with one that dies at once.
+        account.refreshIfExpiring()
+        // Rows from before accounts were tracked go to the first account that signs in afterwards.
+        repository.adoptUnowned(accountId)
         var needsRetry = false
 
-        when (createPendingSessions(onlySessionId)) {
+        when (createPendingSessions(accountId, onlySessionId)) {
             QueueRunResult.RETRY -> needsRetry = true
             QueueRunResult.DONE -> Unit
         }
@@ -114,9 +138,11 @@ class UploadProcessor(
             // The export first: its files join the queue (at the front) before the first file is picked below. It
             // writes only to staging, stops within a frame when a take starts, and can never fail the session it
             // belongs to. While recording it does nothing, and uploads simply carry on.
-            exportStage?.runPending(onlySessionId)
+            exportStage?.runPending(onlySessionId, accountId)
             while (true) {
-                val next = repository.runnable().firstOrNull { it.id !in skipped && (onlySessionId == null || it.sessionId == onlySessionId) } ?: break
+                // Signed out, or another account signed in, mid-pass: this account's work stops here.
+                if (account.accountId() != accountId) return QueueRunResult.DONE
+                val next = repository.runnable(accountId).firstOrNull { it.id !in skipped && (onlySessionId == null || it.sessionId == onlySessionId) } ?: break
                 when (val outcome = processFile(next)) {
                     FileOutcome.Done, FileOutcome.Failed -> Unit
                     is FileOutcome.Retry -> {
@@ -127,46 +153,68 @@ class UploadProcessor(
                 }
             }
             passes++
-        } while (passes < MAX_EXPORT_PASSES && !isRecording() && exportStage?.hasWork() == true)
+        } while (passes < MAX_EXPORT_PASSES && !isRecording() && exportStage?.hasWork(accountId) == true)
 
-        if (completeFinishedSessions(onlySessionId) == QueueRunResult.RETRY) needsRetry = true
+        if (account.accountId() != accountId) return QueueRunResult.DONE
+        if (completeFinishedSessions(accountId, onlySessionId) == QueueRunResult.RETRY) needsRetry = true
         return if (needsRetry) QueueRunResult.RETRY else QueueRunResult.DONE
     }
 
     // ---- session creation ------------------------------------------------------------------
 
-    private suspend fun createPendingSessions(onlySessionId: String?): QueueRunResult {
+    private suspend fun createPendingSessions(accountId: String, onlySessionId: String?): QueueRunResult {
         var result = QueueRunResult.DONE
-        for (session in repository.sessionsNeedingCreation().filter { onlySessionId == null || it.sessionId == onlySessionId }) {
-            val manifest = SessionManifestInfo.read(File(session.directoryPath))
+        for (session in repository.sessionsNeedingCreation(accountId).filter { onlySessionId == null || it.sessionId == onlySessionId }) {
+            if (account.accountId() != accountId) return QueueRunResult.DONE
+            val directory = File(session.directoryPath)
+            // Only a good, complete recording is ever given a campaign and queued, so this holds already; but the
+            // marketplace refuses an incomplete recording for good, so one must never even be offered to it.
+            if (session.recordingStatus == CloudFileRules.STATUS_INCOMPLETE) {
+                repository.markSessionFailed(session.sessionId, "Not uploaded: recording incomplete")
+                CloudLog.w("session_not_eligible", "session" to session.sessionId)
+                continue
+            }
+            val manifest = SessionManifestInfo.read(directory)
             val request = CreateSessionRequest(
                 sessionId = session.sessionId,
                 deviceId = installationId(),
                 createdAt = manifest?.startWallTimeUtc ?: isoUtc(session.createdAt),
                 recordingStatus = session.recordingStatus ?: manifest?.recordingStatus ?: "recording",
                 appVersion = appVersion,
-                pipe = session.pipe,
+                campaignId = session.pipe,
+                deviceFingerprint = DeviceFingerprint.read(directory),
+                take = manifest?.take?.toInfo(),
             )
             try {
                 val response = api.createSession(request)
+                // The backend is the authority on whether the raw data is wanted: the phone's cache may be out of date.
+                val rawWanted = response.rawRequired
+                if (rawWanted != null && rawWanted != session.rawRequired) {
+                    repository.setRawRequired(session.sessionId, rawWanted)
+                    if (rawWanted) repository.addFiles(session.sessionId, directory, rawPlan(session.sessionId, directory))
+                }
                 repository.markSessionCreated(session.sessionId)
                 CloudLog.i("session_created", "session" to session.sessionId, "new" to response.created)
             } catch (cancel: CancellationException) {
                 throw cancel
             } catch (error: CloudException) {
                 if (error.retryable) {
-                    repository.noteSessionError(session.sessionId, error.message.orEmpty())
+                    repository.noteSessionError(session.sessionId, describe(error))
                     CloudLog.w("session_create_retry", "session" to session.sessionId, "error" to error.message)
                     if (error is CloudNetworkException) return QueueRunResult.RETRY
                     result = QueueRunResult.RETRY
                 } else {
-                    repository.markSessionFailed(session.sessionId, error.message.orEmpty())
+                    repository.markSessionFailed(session.sessionId, describe(error))
                     CloudLog.e("session_create_failed", error, "session" to session.sessionId)
                 }
             }
         }
         return result
     }
+
+    /** What to remember about a failure: the plain-words message for a campaign refusal, else the full log message. */
+    private fun describe(error: CloudException): String =
+        (error as? CloudHttpException)?.takeIf { it.code in CloudHttpException.PERMANENT_MESSAGES }?.userMessage ?: error.message.orEmpty()
 
     // ---- one file --------------------------------------------------------------------------
 
@@ -310,7 +358,7 @@ class UploadProcessor(
             error.retryable -> retry(row, error.message.orEmpty(), networkDown = false)
 
             else -> {
-                repository.markFailed(row.id, error.message.orEmpty())
+                repository.markFailed(row.id, describe(error))
                 CloudLog.e("upload_failed", error, "session" to row.sessionId, "path" to row.relativePath)
                 FileOutcome.Failed
             }
@@ -328,25 +376,29 @@ class UploadProcessor(
 
     // ---- session completion ----------------------------------------------------------------
 
-    private suspend fun completeFinishedSessions(onlySessionId: String?): QueueRunResult {
+    private suspend fun completeFinishedSessions(accountId: String, onlySessionId: String?): QueueRunResult {
         var result = QueueRunResult.DONE
-        for (session in repository.sessionsReadyToComplete().filter { onlySessionId == null || it.sessionId == onlySessionId }) {
+        for (session in repository.sessionsReadyToComplete(accountId).filter { onlySessionId == null || it.sessionId == onlySessionId }) {
+            if (account.accountId() != accountId) return QueueRunResult.DONE
             val files = repository.uploadsForSession(session.sessionId)
                 .filter { it.state == UploadState.VERIFIED }
                 .map { SessionFileRef(it.relativePath, it.sizeBytes) }
             try {
-                api.completeSession(session.sessionId, session.recordingStatus ?: "complete", files)
-                repository.markSessionSynced(session.sessionId)
+                val view: CloudSessionView = api.completeSession(session.sessionId, session.recordingStatus ?: "complete", files)
+                repository.markSessionSynced(session.sessionId, view)
                 syncedThisRun++
-                CloudLog.i("session_synced", "session" to session.sessionId, "files" to files.size)
+                CloudLog.i(
+                    "session_synced", "session" to session.sessionId, "files" to files.size,
+                    "marketplace" to view.marketplace?.status,
+                )
             } catch (cancel: CancellationException) {
                 throw cancel
             } catch (error: CloudException) {
                 val http = error as? CloudHttpException
                 when {
-                    http?.code == CloudHttpException.SESSION_INCOMPLETE -> {
-                        // The backend disagrees about which files it holds: send those again.
-                        requeueFilesReportedBy(session.sessionId, http.details)
+                    http?.code == CloudHttpException.INCOMPLETE || http?.code == CloudHttpException.SESSION_INCOMPLETE -> {
+                        // The backend disagrees about which files it holds: send those again, and add the raw data it asks for.
+                        reconcileIncomplete(session, http.details)
                         result = QueueRunResult.RETRY
                     }
                     http?.code == CloudHttpException.SESSION_NOT_FOUND -> {
@@ -354,13 +406,13 @@ class UploadProcessor(
                         result = QueueRunResult.RETRY
                     }
                     error.retryable -> {
-                        repository.noteSessionError(session.sessionId, error.message.orEmpty())
+                        repository.noteSessionError(session.sessionId, describe(error))
                         CloudLog.w("session_complete_retry", "session" to session.sessionId, "error" to error.message)
                         if (error is CloudNetworkException) return QueueRunResult.RETRY
                         result = QueueRunResult.RETRY
                     }
                     else -> {
-                        repository.markSessionFailed(session.sessionId, error.message.orEmpty())
+                        repository.markSessionFailed(session.sessionId, describe(error))
                         CloudLog.e("session_complete_failed", error, "session" to session.sessionId)
                     }
                 }
@@ -369,19 +421,28 @@ class UploadProcessor(
         return result
     }
 
-    private suspend fun requeueFilesReportedBy(sessionId: String, details: String?) {
+    /** `409 INCOMPLETE {unverified: [...], missingRequired: [...]}` (older backends: `missing`). */
+    private suspend fun reconcileIncomplete(session: CloudSessionEntity, details: String?) {
         val json = runCatching { JSONObject(details.orEmpty()) }.getOrNull()
-        val paths = buildSet {
-            for (key in listOf("missing", "unverified")) {
-                val array = json?.optJSONArray(key) ?: continue
-                for (i in 0 until array.length()) add(array.optString(i))
-            }
+        val missing = pathsIn(json, "missingRequired", "missing")
+        val unverified = pathsIn(json, "unverified")
+        // The backend wants raw files this recording was not queued with (its campaign collects raw data after all).
+        if (!session.rawRequired && missing.any { CloudFileRules.isRaw(it) }) {
+            val directory = File(session.directoryPath)
+            repository.setRawRequired(session.sessionId, true)
+            repository.addFiles(session.sessionId, directory, rawPlan(session.sessionId, directory))
         }
-        val rows = repository.uploadsForSession(sessionId)
-        for (row in rows) {
-            if (row.relativePath in paths && row.state == UploadState.VERIFIED) {
+        for (row in repository.uploadsForSession(session.sessionId)) {
+            if (row.relativePath in unverified + missing && row.state == UploadState.VERIFIED) {
                 repository.resetToPending(row.id, "Backend reports this file is not verified; re-uploading")
             }
+        }
+    }
+
+    private fun pathsIn(json: JSONObject?, vararg keys: String): Set<String> = buildSet {
+        for (key in keys) {
+            val array = json?.optJSONArray(key) ?: continue
+            for (i in 0 until array.length()) add(array.optString(i))
         }
     }
 

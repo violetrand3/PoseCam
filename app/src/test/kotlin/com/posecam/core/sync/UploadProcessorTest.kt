@@ -105,7 +105,7 @@ class UploadProcessorTest {
                 return S3PutResult("e")
             }
         }
-        val processor = UploadProcessor(f.repo, f.api, reporting, FileHasher(), { "install-1" }, "test", progressIntervalMs = 20)
+        val processor = UploadProcessor(f.repo, f.api, reporting, FileHasher(), { "install-1" }, "test", progressIntervalMs = 20, account = AccountScope.fixed(SyncFixture.ACCOUNT))
 
         processor.runQueue()
 
@@ -326,7 +326,7 @@ class UploadProcessorTest {
                 return original.put(url, headers, file, offset, length, onProgress)
             }
         }
-        val processor = UploadProcessor(f.repo, f.api, failingTransport, FileHasher(), { "install-1" }, "test")
+        val processor = UploadProcessor(f.repo, f.api, failingTransport, FileHasher(), { "install-1" }, "test", account = AccountScope.fixed(SyncFixture.ACCOUNT))
 
         assertEquals(QueueRunResult.RETRY, processor.runQueue())
 
@@ -413,7 +413,7 @@ class UploadProcessorTest {
                 return original.put(url, headers, file, offset, length, onProgress)
             }
         }
-        val processor = UploadProcessor(f.repo, f.api, growing, FileHasher(), { "install-1" }, "test")
+        val processor = UploadProcessor(f.repo, f.api, growing, FileHasher(), { "install-1" }, "test", account = AccountScope.fixed(SyncFixture.ACCOUNT))
 
         assertEquals(QueueRunResult.RETRY, processor.runQueue())
 
